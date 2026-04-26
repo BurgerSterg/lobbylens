@@ -13,6 +13,15 @@ dist
 dist-ssr
 *.local
 
+# Build output
+src-tauri/target/
+
+# Tauri dev
+src-tauri/WixTools/
+
+# OS
+Thumbs.db
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
