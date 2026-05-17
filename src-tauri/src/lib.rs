@@ -30,6 +30,23 @@ pub struct MatchRecord {
     pub my_puuid: String,
     pub my_team: Vec<String>,
     pub enemy_team: Vec<String>,
+    #[serde(default)]
+    pub kills: Option<u32>,
+    #[serde(default)]
+    pub deaths: Option<u32>,
+    #[serde(default)]
+    pub assists: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MmrCacheEntry {
+    pub tier: u32,
+    pub tier_name: String,
+    pub rr: i32,
+    pub peak_tier: u32,
+    pub peak_tier_name: String,
+    pub fetched_at: i64,
 }
 
 fn parse_lockfile() -> Result<Lockfile, String> {
@@ -406,6 +423,33 @@ mod commands {
     }
 
     #[tauri::command]
+    pub fn load_mmr_cache(app: tauri::AppHandle) -> Result<std::collections::HashMap<String, super::MmrCacheEntry>, String> {
+        let path = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| e.to_string())?
+            .join("mmr_cache.json");
+        if !path.exists() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&content).map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub fn save_mmr_cache(
+        app: tauri::AppHandle,
+        entries: std::collections::HashMap<String, super::MmrCacheEntry>,
+    ) -> Result<(), String> {
+        let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join("mmr_cache.json");
+        let json = serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())?;
+        let mut file = fs::File::create(&path).map_err(|e| e.to_string())?;
+        file.write_all(json.as_bytes()).map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
     pub async fn set_always_on_top(app: tauri::AppHandle, value: bool) -> Result<(), String> {
         use tauri::Manager;
         app.get_webview_window("main")
@@ -431,6 +475,8 @@ pub fn run() {
             commands::get_player_names,
             commands::load_match_history,
             commands::save_match_history,
+            commands::load_mmr_cache,
+            commands::save_mmr_cache,
             commands::set_always_on_top
         ])
         .run(tauri::generate_context!())

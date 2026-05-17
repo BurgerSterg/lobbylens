@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    lobbylens_lib::run()
+    burgerlens_lib::run()
 }

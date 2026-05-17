@@ -10,7 +10,7 @@ const DEFAULTS: Settings = {
   opacity: 1,
 };
 
-const STORAGE_KEY = "lobbylens_settings";
+const STORAGE_KEY = "burgerlens_settings";
 
 export function loadSettings(): Settings {
   try {

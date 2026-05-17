@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { henrikFetch } from "../api/henrik";
+import { henrikFetch, henrikMatchHistoryShard } from "../api/henrik";
 import type { MatchHistorySummary, MatchRecord, PendingMatchFlush } from "../types";
 
 export type { MatchHistorySummary, MatchRecord, PendingMatchFlush };
@@ -10,6 +10,46 @@ export async function loadHistory(): Promise<MatchRecord[]> {
   if (cachedHistory) return cachedHistory;
   cachedHistory = await invoke<MatchRecord[]>("load_match_history");
   return cachedHistory;
+}
+
+/** Stats vs another player (all stored history rows where they appear on either side). */
+export async function getMatchStatsAgainstPlayer(
+  puuid: string,
+): Promise<{ timesMatched: number; timesEnemy: number; timesTeammate: number }> {
+  const history = await loadHistory();
+  let timesEnemy = 0;
+  let timesTeammate = 0;
+  for (const m of history) {
+    if (!m.my_team.includes(puuid) && !m.enemy_team.includes(puuid)) continue;
+    if (m.my_team.includes(puuid)) timesTeammate++;
+    else timesEnemy++;
+  }
+  return {
+    timesMatched: timesTeammate + timesEnemy,
+    timesEnemy,
+    timesTeammate,
+  };
+}
+
+/** Scoped to a single account (your `myPuuid`) for UI when you know the local player. */
+export function getMatchStatsAgainstPlayerFromHistory(
+  history: ReadonlyArray<MatchRecord>,
+  myPuuid: string,
+  opponentPuuid: string,
+): { timesMatched: number; timesEnemy: number; timesTeammate: number } {
+  let timesEnemy = 0;
+  let timesTeammate = 0;
+  for (const m of history) {
+    if (m.my_puuid !== myPuuid) continue;
+    if (!m.my_team.includes(opponentPuuid) && !m.enemy_team.includes(opponentPuuid)) continue;
+    if (m.my_team.includes(opponentPuuid)) timesTeammate++;
+    else timesEnemy++;
+  }
+  return {
+    timesMatched: timesTeammate + timesEnemy,
+    timesEnemy,
+    timesTeammate,
+  };
 }
 
 export async function saveHistory(records: MatchRecord[]): Promise<void> {
@@ -24,11 +64,12 @@ export async function backfillMatchHistory(
 ): Promise<MatchRecord[]> {
   const records: MatchRecord[] = [];
   let page = 1;
-  const pageSize = 20;
+  const pageSize = 10;
 
+  const shard = henrikMatchHistoryShard(region);
   while (true) {
     const res = await henrikFetch(
-      `https://api.henrikdev.xyz/valorant/v3/by-puuid/matches/${region}/pc/${puuid}?size=${pageSize}&page=${page}`,
+      `https://api.henrikdev.xyz/valorant/v3/by-puuid/matches/${shard}/pc/${puuid}?size=${pageSize}&page=${page}`,
       henrikApiKey,
     );
     if (!res.ok) break;
@@ -82,8 +123,9 @@ export async function flushPendingMatchToHistory(
 ): Promise<void> {
   if (!pending || !myPuuid) return;
   try {
+    const shard = henrikMatchHistoryShard(region);
     const res = await henrikFetch(
-      `https://api.henrikdev.xyz/valorant/v3/by-puuid/matches/${region}/pc/${myPuuid}?size=1`,
+      `https://api.henrikdev.xyz/valorant/v3/by-puuid/matches/${shard}/pc/${myPuuid}?size=1`,
       henrikApiKey,
     );
     if (res.ok) {
@@ -99,6 +141,15 @@ export async function flushPendingMatchToHistory(
           (m?.teams?.blue?.has_won === true && myTeamId === "blue");
         const history = await loadHistory();
         if (!history.find((r) => r.match_id === pending.matchId)) {
+          const stats = mePl?.stats ?? mePl;
+          const k = stats?.kills;
+          const d = stats?.deaths;
+          const a = stats?.assists;
+          const kda: { kills?: number; deaths?: number; assists?: number } = {};
+          if (k != null && Number.isFinite(Number(k))) kda.kills = Number(k);
+          if (d != null && Number.isFinite(Number(d))) kda.deaths = Number(d);
+          if (a != null && Number.isFinite(Number(a))) kda.assists = Number(a);
+
           history.unshift({
             match_id: pending.matchId,
             map: pending.map,
@@ -107,6 +158,7 @@ export async function flushPendingMatchToHistory(
             my_puuid: myPuuid,
             my_team: pending.myTeam,
             enemy_team: pending.enemyTeam,
+            ...kda,
           });
           await saveHistory(history);
         }

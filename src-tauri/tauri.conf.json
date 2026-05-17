@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "lobbylens",
+  "productName": "BurgerLens",
   "version": "0.1.0",
-  "identifier": "com.lobbylens.dev",
+  "identifier": "com.burgerlens.dev",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,9 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "lobbylens",
-        "width": 800,
-        "height": 600,
+        "title": "BurgerLens",
+        "width": 1100,
+        "height": 700,
+        "minWidth": 1100,
+        "minHeight": 600,
         "alwaysOnTop": true
       }
     ],

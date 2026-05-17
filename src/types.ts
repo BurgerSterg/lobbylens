@@ -17,6 +17,17 @@ export interface PlayerPresence {
   rank_icon: string | null;
 }
 
+export interface PlayerMatchStats {
+  puuid: string;
+  kda: number;
+  kills: number;
+  deaths: number;
+  assists: number;
+  winRate: number;
+  matchesPlayed: number;
+  avgACS: number;
+}
+
 export interface PregamePlayer {
   puuid: string;
   agent_id: string;
@@ -42,7 +53,20 @@ export interface MatchRecord {
   my_puuid: string;
   my_team: string[];
   enemy_team: string[];
+  kills?: number;
+  deaths?: number;
+  assists?: number;
 }
+
+/** Persisted MMR rows in mmr_cache.json (puuid -> entry). */
+export type MmrDiskCacheEntry = {
+  tier: number;
+  tierName: string;
+  rr: number;
+  peakTier: number;
+  peakTierName: string;
+  fetchedAt: number;
+};
 
 export interface MatchHistorySummary {
   count: number;
@@ -65,3 +89,10 @@ export type MmrEntry = {
   rank_icon: string | null;
   peak_rank_icon: string | null;
 };
+
+export type FetchPhase =
+  | "idle"
+  | "detecting"
+  | "loading_players"
+  | "loading_ranks"
+  | "done";

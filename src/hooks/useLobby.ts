@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import type { MmrEntry, PlayerPresence, PregamePlayer, Settings } from "../types";
+import type { FetchPhase, MmrEntry, PlayerMatchStats, PlayerPresence, PregamePlayer, Settings } from "../types";
 import {
   backfillMatchHistory,
   flushPendingMatchToHistory,
@@ -10,7 +10,9 @@ import {
   cachedMMR,
   fetchHenrikAccountLevel,
   fetchHenrikMmrForPlayer,
+  fetchPlayerRecentStats,
   identityAccountLevelValue,
+  initMmrDiskCache,
   mergeIncognitoNamesFromHenrik,
   resetHenrikLobbyCaches,
   resolvedAccountLevels,
@@ -123,6 +125,82 @@ function mergePartyIdsFromPresences(
   }
 }
 
+export type PlayerRow = PregamePlayer;
+
+function partitionBlueRed(players: PlayerRow[]): { blue: PlayerRow[]; red: PlayerRow[] } {
+  const ids = [...new Set(players.map((p) => p.team_id).filter(Boolean))].sort();
+  if (ids.length >= 2) {
+    const blueId = ids[0]!;
+    const redId = ids[1]!;
+    return {
+      blue: players.filter((p) => p.team_id === blueId),
+      red: players.filter((p) => p.team_id === redId),
+    };
+  }
+  return {
+    blue: players.filter((p) => p.team_id === "Blue" || p.team_id === "ally"),
+    red: players.filter((p) => p.team_id === "Red" || p.team_id === "enemy"),
+  };
+}
+
+/** Competitive tier id → 0..1 (unranked 0; Iron 1 → 1/25 … Radiant → 1). */
+function tierToNorm(competitiveTier: number): number {
+  if (!competitiveTier || competitiveTier < 3) return 0;
+  const slot = Math.min(Math.max(competitiveTier - 2, 1), 25);
+  return slot / 25;
+}
+
+function average(nums: number[]): number {
+  if (nums.length === 0) return 0;
+  return nums.reduce((a, b) => a + b, 0) / nums.length;
+}
+
+function teamComposite(team: PlayerRow[], statsByPuuid: Record<string, PlayerMatchStats>): number {
+  const kdaNorms = team
+    .map((p) => statsByPuuid[p.puuid]?.kda)
+    .filter((x): x is number => x != null && Number.isFinite(x))
+    .map((kda) => Math.min(Math.max(kda / 2.5, 0), 1));
+
+  const winRates = team
+    .map((p) => statsByPuuid[p.puuid]?.winRate)
+    .filter((x): x is number => x != null && Number.isFinite(x));
+
+  const ranks = team.map((p) => tierToNorm(p.competitive_tier));
+  const peaks = team.map((p) => tierToNorm(p.peak_tier));
+
+  return (
+    0.35 * average(kdaNorms) +
+    0.3 * average(winRates) +
+    0.25 * average(ranks) +
+    0.1 * average(peaks)
+  );
+}
+
+export function calculateWinProbability(
+  players: PlayerRow[],
+  playerStats: Record<string, PlayerMatchStats>,
+): { blueWinPct: number; redWinPct: number; confidence: "low" | "medium" | "high" } {
+  const { blue, red } = partitionBlueRed(players);
+  const blueScore = teamComposite(blue, playerStats);
+  const redScore = teamComposite(red, playerStats);
+  const sum = blueScore + redScore;
+  let blueWinPct = sum > 0 ? (blueScore / sum) * 100 : 50;
+  let redWinPct = sum > 0 ? (redScore / sum) * 100 : 50;
+  const totalPct = blueWinPct + redWinPct;
+  if (totalPct > 0) {
+    blueWinPct = (blueWinPct / totalPct) * 100;
+    redWinPct = (redWinPct / totalPct) * 100;
+  }
+
+  const withStats = players.filter((p) => playerStats[p.puuid] != null).length;
+  let confidence: "low" | "medium" | "high";
+  if (withStats < 6) confidence = "low";
+  else if (withStats <= 8) confidence = "medium";
+  else confidence = "high";
+
+  return { blueWinPct, redWinPct, confidence };
+}
+
 export function useLobby(settings: Settings) {
   const [players, setPlayers] = useState<PlayerPresence[]>([]);
   const [pregamePlayers, setPregamePlayers] = useState<PregamePlayer[]>([]);
@@ -131,21 +209,81 @@ export function useLobby(settings: Settings) {
   const [mapName, setMapName] = useState<string>("");
   const [serverName, setServerName] = useState<string>("");
   const [localPuuid, setLocalPuuid] = useState<string>("");
+  const [fetchPhase, setFetchPhase] = useState<FetchPhase>("idle");
+  const [mmrProgress, setMmrProgress] = useState<{ fetched: number; total: number }>({ fetched: 0, total: 0 });
+  const [matchState, setMatchState] = useState<"MENUS" | "PREGAME" | "INGAME" | null>(null);
+  const [playerStats, setPlayerStats] = useState<Record<string, PlayerMatchStats>>({});
+  const [playerStatLoading, setPlayerStatLoading] = useState<Record<string, boolean>>({});
 
   const isFetchingRef = useRef(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const detectIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pendingMatchRef = useRef<{
     matchId: string;
     map: string;
     myTeam: string[];
     enemyTeam: string[];
   } | null>(null);
+  const statsMatchIdRef = useRef<string | null>(null);
+  const statsKickStartedRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    startDetecting();
+    void initMmrDiskCache();
+    return () => {
+      stopPolling();
+      stopDetecting();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!settings.henrikApiKey) return;
+    void (async () => {
+      const existing = await loadHistory();
+      if (existing.length > 0) return;
+      if (!localPuuid) return;
+      await backfillMatchHistory(localPuuid, settings.region, settings.henrikApiKey);
+    })();
+  }, [localPuuid, settings.henrikApiKey, settings.region]);
 
   async function flushPendingMatch(myPuuid: string) {
     if (!pendingMatchRef.current || !myPuuid) return;
     const pending = pendingMatchRef.current;
     pendingMatchRef.current = null;
     await flushPendingMatchToHistory(pending, myPuuid, settings.region, settings.henrikApiKey);
+  }
+
+  async function detectMatchState() {
+    try {
+      const session = await getLocalPlayer();
+      const tokens = await getAuthTokens();
+      const region = String(session.region ?? settings.region);
+      try {
+        await getPregameMatchIdExternal(session.puuid, tokens, region);
+        setMatchState("PREGAME");
+        return;
+      } catch {}
+      try {
+        await getCoregameMatchIdExternal(session.puuid, tokens, region);
+        setMatchState("INGAME");
+        return;
+      } catch {}
+      setMatchState("MENUS");
+    } catch {
+      setMatchState(null);
+    }
+  }
+
+  function startDetecting() {
+    if (detectIntervalRef.current) return;
+    detectIntervalRef.current = setInterval(detectMatchState, 1000);
+  }
+
+  function stopDetecting() {
+    if (detectIntervalRef.current) {
+      clearInterval(detectIntervalRef.current);
+      detectIntervalRef.current = null;
+    }
   }
 
   function startPolling() {
@@ -161,25 +299,12 @@ export function useLobby(settings: Settings) {
     }
   }
 
-  useEffect(() => {
-    return () => stopPolling();
-  }, []);
-
-  useEffect(() => {
-    if (!settings.henrikApiKey) return;
-    void (async () => {
-      const existing = await loadHistory();
-      if (existing.length > 0) return;
-      if (!localPuuid) return;
-      await backfillMatchHistory(localPuuid, settings.region, settings.henrikApiKey);
-    })();
-  }, [localPuuid, settings.henrikApiKey, settings.region]);
-
   async function fetchLobby() {
     if (isFetchingRef.current) return;
     isFetchingRef.current = true;
     setLoading(true);
     setError(null);
+    setFetchPhase("detecting");
     let puuid = "";
     let result: Omit<PlayerPresence, "rank_icon">[] = [];
     try {
@@ -192,8 +317,26 @@ export function useLobby(settings: Settings) {
 
       const tokens = await getAuthTokens();
 
+      const kickoffPlayerStatsIfNeeded = (mid: string, rosterPuuids: string[]) => {
+        if (!settings.henrikApiKey.trim()) return;
+        if (statsKickStartedRef.current === mid) return;
+        statsKickStartedRef.current = mid;
+        setPlayerStatLoading(Object.fromEntries(rosterPuuids.map((id) => [id, true])));
+        void Promise.allSettled(
+          rosterPuuids.map(async (id) => {
+            try {
+              const result = await fetchPlayerRecentStats(id, region, settings.henrikApiKey);
+              if (result) setPlayerStats((prev) => ({ ...prev, [id]: result }));
+            } finally {
+              setPlayerStatLoading((prev) => ({ ...prev, [id]: false }));
+            }
+          }),
+        );
+      };
+
       result = await getPresences();
       mergePartyIdsFromPresences(result);
+      setFetchPhase("loading_players");
 
       const newPartyIds = [
         ...new Set(
@@ -254,6 +397,12 @@ export function useLobby(settings: Settings) {
 
       try {
         const matchId = await getPregameMatchIdExternal(puuid, tokens, region);
+        if (statsMatchIdRef.current !== matchId) {
+          statsMatchIdRef.current = matchId;
+          statsKickStartedRef.current = null;
+          setPlayerStats({});
+          setPlayerStatLoading({});
+        }
         const match = await getPregameMatchExternal(matchId, tokens, region);
 
         setMapName(getMapName(match.MapID ?? ""));
@@ -271,6 +420,22 @@ export function useLobby(settings: Settings) {
         }
 
         await mergeIncognitoNamesFromHenrik(allPuuids, nameMap, settings.region, settings.henrikApiKey);
+
+        // Cross-reference presences for incognito players who are friends
+        // Incognito hides names from strangers but presence data exposes friends' names
+        for (const puuid of Object.keys(nameMap)) {
+          if (!nameMap[puuid]?.game_name) {
+            const presenceMatch = result.find(
+              (p: any) => p.puuid === puuid && p.game_name
+            );
+            if (presenceMatch?.game_name) {
+              nameMap[puuid] = {
+                game_name: presenceMatch.game_name,
+                tag_line: presenceMatch.game_tag ?? "",
+              };
+            }
+          }
+        }
 
         const mapped: PregamePlayer[] = allyPlayers.map((p: any) => {
           const name = nameMap[p.Subject] ?? { game_name: "Incognito", tag_line: "" };
@@ -316,23 +481,63 @@ export function useLobby(settings: Settings) {
 
         const allMapped = [...mapped, ...enemyMapped];
 
+        setPregamePlayers(applyPartyColorsToMerged(allMapped));
+
         let mmrMap: Record<string, MmrEntry> = {};
 
         if (!cachedMMR.current || cachedMMR.current.matchId !== matchId) {
-          try {
-            const mmrResults = await Promise.all(
-              allMapped.map((p) =>
-                fetchHenrikMmrForPlayer(p.puuid, settings.region, settings.henrikApiKey, rankMap),
+          setFetchPhase("loading_ranks");
+          setMmrProgress({ fetched: 0, total: allMapped.length });
+
+          /** Updates lobby roster rank fields when a batched MMR 429 retry succeeds (pregame). */
+          const onMmrResolvedAfterRetry = (playerPuuid: string, entry: MmrEntry) => {
+            if (cachedMMR.current?.matchId === matchId) {
+              cachedMMR.current.data[playerPuuid] = entry;
+            }
+            setPregamePlayers((prev) =>
+              prev.map((player) =>
+                player.puuid === playerPuuid
+                  ? {
+                      ...player,
+                      competitive_tier: entry.competitive_tier,
+                      peak_tier: entry.peak_tier,
+                      rank_icon: entry.rank_icon,
+                      peak_rank_icon: entry.peak_rank_icon,
+                    }
+                  : player,
               ),
             );
-            mmrMap = {};
-            allMapped.forEach((p, i) => {
-              mmrMap[p.puuid] = mmrResults[i];
-            });
-            cachedMMR.current = { matchId, data: mmrMap };
-          } catch {
-            mmrMap = cachedMMR.current?.data ?? {};
-          }
+          };
+
+          await Promise.all(
+            allMapped.map(async (p) => {
+              const entry = await fetchHenrikMmrForPlayer(
+                p.puuid,
+                settings.region,
+                settings.henrikApiKey,
+                rankMap,
+                onMmrResolvedAfterRetry,
+              );
+              mmrMap[p.puuid] = entry;
+              setMmrProgress((prev) => ({ fetched: prev.fetched + 1, total: prev.total }));
+
+              setPregamePlayers((prev) =>
+                prev.map((player) =>
+                  player.puuid === p.puuid
+                    ? {
+                        ...player,
+                        competitive_tier: entry.competitive_tier,
+                        peak_tier: entry.peak_tier,
+                        rank_icon: entry.rank_icon,
+                        peak_rank_icon: entry.peak_rank_icon,
+                      }
+                    : player,
+                ),
+              );
+            }),
+          );
+
+          cachedMMR.current = { matchId, data: mmrMap };
         } else {
           mmrMap = cachedMMR.current.data;
         }
@@ -346,10 +551,22 @@ export function useLobby(settings: Settings) {
         }));
 
         setPregamePlayers(applyPartyColorsToMerged(merged));
+
+        kickoffPlayerStatsIfNeeded(
+          matchId,
+          allMapped.map((p) => p.puuid),
+        );
       } catch {
         try {
           const matchId = await getCoregameMatchIdExternal(puuid, tokens, region);
+          if (statsMatchIdRef.current !== matchId) {
+            statsMatchIdRef.current = matchId;
+            statsKickStartedRef.current = null;
+            setPlayerStats({});
+            setPlayerStatLoading({});
+          }
           const match = await getCoregameMatchExternal(matchId, tokens, region);
+
           const corePlayers = dedupePlayersBySubject(match.Players);
 
           setMapName(getMapName(match.MapID ?? ""));
@@ -364,6 +581,22 @@ export function useLobby(settings: Settings) {
           }
 
           await mergeIncognitoNamesFromHenrik(puuids, nameMap, settings.region, settings.henrikApiKey);
+
+          // Cross-reference presences for incognito players who are friends
+          // Incognito hides names from strangers but presence data exposes friends' names
+          for (const puuid of Object.keys(nameMap)) {
+            if (!nameMap[puuid]?.game_name) {
+              const presenceMatch = result.find(
+                (p: any) => p.puuid === puuid && p.game_name
+              );
+              if (presenceMatch?.game_name) {
+                nameMap[puuid] = {
+                  game_name: presenceMatch.game_name,
+                  tag_line: presenceMatch.game_tag ?? "",
+                };
+              }
+            }
+          }
 
           const mapped: PregamePlayer[] = corePlayers.map((p: any) => {
             const name = nameMap[p.Subject] ?? { game_name: "Incognito", tag_line: "" };
@@ -387,23 +620,63 @@ export function useLobby(settings: Settings) {
             };
           });
 
+          setPregamePlayers(applyPartyColorsToMerged(mapped));
+
           let mmrMap: Record<string, MmrEntry> = {};
 
           if (!cachedMMR.current || cachedMMR.current.matchId !== matchId) {
-            try {
-              const mmrResults = await Promise.all(
-                mapped.map((p) =>
-                  fetchHenrikMmrForPlayer(p.puuid, settings.region, settings.henrikApiKey, rankMap),
+            setFetchPhase("loading_ranks");
+            setMmrProgress({ fetched: 0, total: mapped.length });
+
+            /** Updates lobby roster rank fields when a batched MMR 429 retry succeeds (coregame / ingame). */
+            const onMmrResolvedAfterRetry = (playerPuuid: string, entry: MmrEntry) => {
+              if (cachedMMR.current?.matchId === matchId) {
+                cachedMMR.current.data[playerPuuid] = entry;
+              }
+              setPregamePlayers((prev) =>
+                prev.map((player) =>
+                  player.puuid === playerPuuid
+                    ? {
+                        ...player,
+                        competitive_tier: entry.competitive_tier,
+                        peak_tier: entry.peak_tier,
+                        rank_icon: entry.rank_icon,
+                        peak_rank_icon: entry.peak_rank_icon,
+                      }
+                    : player,
                 ),
               );
-              mmrMap = {};
-              mapped.forEach((p, i) => {
-                mmrMap[p.puuid] = mmrResults[i];
-              });
-              cachedMMR.current = { matchId, data: mmrMap };
-            } catch {
-              mmrMap = cachedMMR.current?.data ?? {};
-            }
+            };
+
+            await Promise.all(
+              mapped.map(async (p) => {
+                const entry = await fetchHenrikMmrForPlayer(
+                  p.puuid,
+                  settings.region,
+                  settings.henrikApiKey,
+                  rankMap,
+                  onMmrResolvedAfterRetry,
+                );
+                mmrMap[p.puuid] = entry;
+                setMmrProgress((prev) => ({ fetched: prev.fetched + 1, total: prev.total }));
+
+                setPregamePlayers((prev) =>
+                  prev.map((player) =>
+                    player.puuid === p.puuid
+                      ? {
+                          ...player,
+                          competitive_tier: entry.competitive_tier,
+                          peak_tier: entry.peak_tier,
+                          rank_icon: entry.rank_icon,
+                          peak_rank_icon: entry.peak_rank_icon,
+                        }
+                      : player,
+                  ),
+                );
+              }),
+            );
+
+            cachedMMR.current = { matchId, data: mmrMap };
           } else {
             mmrMap = cachedMMR.current.data;
           }
@@ -415,6 +688,11 @@ export function useLobby(settings: Settings) {
             peak_tier: mmrMap[row.puuid]?.peak_tier ?? 0,
             peak_rank_icon: mmrMap[row.puuid]?.peak_rank_icon ?? null,
           }));
+
+          kickoffPlayerStatsIfNeeded(
+            matchId,
+            mapped.map((p) => p.puuid),
+          );
 
           await Promise.all(
             merged.map(async (p) => {
@@ -463,6 +741,10 @@ export function useLobby(settings: Settings) {
         setServerName("");
         accumulatedPartyIdsByPuuid = {};
         for (const k of Object.keys(knownPartyMembers)) delete knownPartyMembers[k];
+        statsMatchIdRef.current = null;
+        statsKickStartedRef.current = null;
+        setPlayerStats({});
+        setPlayerStatLoading({});
         resetHenrikLobbyCaches();
         await flushPendingMatch(puuid);
       }
@@ -482,23 +764,34 @@ export function useLobby(settings: Settings) {
         setServerName("");
         accumulatedPartyIdsByPuuid = {};
         for (const k of Object.keys(knownPartyMembers)) delete knownPartyMembers[k];
+        statsMatchIdRef.current = null;
+        statsKickStartedRef.current = null;
+        setPlayerStats({});
+        setPlayerStatLoading({});
         resetHenrikLobbyCaches();
         await flushPendingMatch(puuid);
       }
     } finally {
       isFetchingRef.current = false;
       setLoading(false);
+      setFetchPhase("done");
+      setTimeout(() => setFetchPhase("idle"), 3000);
     }
   }
 
   return {
     players,
     pregamePlayers,
+    playerStats,
+    playerStatLoading,
     mapName,
     serverName,
     localPuuid,
     loading,
     error,
+    fetchPhase,
+    mmrProgress,
+    matchState,
     fetchLobby,
     startPolling,
     stopPolling,

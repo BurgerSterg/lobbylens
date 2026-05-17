@@ -1,5 +1,5 @@
 /**
- * Rasterizes src-tauri/icons/lobbylens_icon.svg into Tauri bundle icon assets.
+ * Rasterizes src-tauri/icons/burgerlens_icon.svg into Tauri bundle icon assets.
  */
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
@@ -10,7 +10,7 @@ import pngToIco from "png-to-ico";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
 const iconsDir = join(root, "src-tauri", "icons");
-const svgPath = join(iconsDir, "lobbylens_icon.svg");
+const svgPath = join(iconsDir, "burgerlens_icon.svg");
 
 function logWrote(relPath) {
   console.log(`Wrote ${relPath}`);
