@@ -11,6 +11,7 @@ import type {
 import { getMatchStatsAgainstPlayerFromHistory } from "./hooks/useMatchHistory";
 import SettingsPanel from "./components/Settings";
 import { loadSettings } from "./store/settings";
+import { useUpdater } from "./hooks/useUpdater";
 
 const RANK_NAMES: Record<number, string> = {
   0: "Unranked",
@@ -352,6 +353,7 @@ function WinProbabilityFooter({
 }
 
 export default function App() {
+  useUpdater();
   const [settings, setSettings] = useState<Settings>(() => loadSettings());
   const [showSettings, setShowSettings] = useState(false);
   const [theme, setTheme] = useState<"dark" | "light">(() => {
