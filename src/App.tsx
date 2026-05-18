@@ -408,7 +408,7 @@ export default function App() {
 
   return (
     <div
-      className={`${isDark ? "dark" : ""} min-h-screen bg-gray-100 dark:bg-gray-950 text-gray-900 dark:text-white`}
+      className="min-h-screen bg-[#0f1117] text-gray-900 dark:text-white"
       style={{ fontFamily: "'Din Next', 'Rajdhani', sans-serif", opacity: settings.opacity }}
     >
       {showSettings && (

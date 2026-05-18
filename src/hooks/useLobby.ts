@@ -125,6 +125,30 @@ function mergePartyIdsFromPresences(
   }
 }
 
+/** Riot/local invoke failed on the wire — retry next poll; not logical "not in match" outcomes. */
+function isSilentTransportError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : typeof e === "string" ? e : String(e);
+  const m = msg.toLowerCase();
+  if (msg.includes("Not in coregame") || msg.includes("Not in pregame")) return false;
+  if (/\b400\b/.test(msg) || /\b404\b/.test(msg)) return false;
+  if (msg.startsWith("Request failed:")) return true;
+  return (
+    m.includes("connection refused") ||
+    m.includes("timed out") ||
+    m.includes("timeout") ||
+    m.includes("unreachable") ||
+    m.includes("econnrefused") ||
+    m.includes("failed to connect") ||
+    m.includes("connection reset") ||
+    m.includes("broken pipe") ||
+    m.includes("network error") ||
+    m.includes("error sending request") ||
+    m.includes("dns error") ||
+    m.includes("ws error") ||
+    m.includes("io error")
+  );
+}
+
 export type PlayerRow = PregamePlayer;
 
 function partitionBlueRed(players: PlayerRow[]): { blue: PlayerRow[]; red: PlayerRow[] } {
@@ -262,14 +286,19 @@ export function useLobby(settings: Settings) {
         await getPregameMatchIdExternal(session.puuid, tokens, region);
         setMatchState("PREGAME");
         return;
-      } catch {}
+      } catch (e) {
+        if (isSilentTransportError(e)) return;
+      }
       try {
         await getCoregameMatchIdExternal(session.puuid, tokens, region);
         setMatchState("INGAME");
         return;
-      } catch {}
+      } catch (e) {
+        if (isSilentTransportError(e)) return;
+      }
       setMatchState("MENUS");
-    } catch {
+    } catch (e) {
+      if (isSilentTransportError(e)) return;
       setMatchState(null);
     }
   }
@@ -558,14 +587,32 @@ export function useLobby(settings: Settings) {
         );
       } catch {
         try {
-          const matchId = await getCoregameMatchIdExternal(puuid, tokens, region);
+          let matchId: string;
+          try {
+            matchId = await getCoregameMatchIdExternal(puuid, tokens, region);
+          } catch (e) {
+            if (isSilentTransportError(e)) {
+              isFetchingRef.current = false;
+              return;
+            }
+            throw e;
+          }
           if (statsMatchIdRef.current !== matchId) {
             statsMatchIdRef.current = matchId;
             statsKickStartedRef.current = null;
             setPlayerStats({});
             setPlayerStatLoading({});
           }
-          const match = await getCoregameMatchExternal(matchId, tokens, region);
+          let match;
+          try {
+            match = await getCoregameMatchExternal(matchId, tokens, region);
+          } catch (e) {
+            if (isSilentTransportError(e)) {
+              isFetchingRef.current = false;
+              return;
+            }
+            throw e;
+          }
 
           const corePlayers = dedupePlayersBySubject(match.Players);
 
@@ -756,6 +803,7 @@ export function useLobby(settings: Settings) {
         })),
       );
     } catch (e) {
+      isFetchingRef.current = false;
       setError(String(e));
       const myState = result.find((p) => p.puuid === puuid)?.session_state?.toUpperCase();
       if (myState === "MENUS" || myState === "MENU") {
