@@ -13,6 +13,9 @@ import SettingsPanel from "./components/Settings";
 import { loadSettings } from "./store/settings";
 import { useUpdater } from "./hooks/useUpdater";
 
+/** Keep in sync with `src-tauri/tauri.conf.json` → `version`. */
+const APP_VERSION = "0.3.1";
+
 const RANK_NAMES: Record<number, string> = {
   0: "Unranked",
   3: "Iron 1", 4: "Iron 2", 5: "Iron 3",
@@ -206,7 +209,8 @@ function StatusStrip({
   mmrProgress: { fetched: number; total: number };
   matchState: "MENUS" | "PREGAME" | "INGAME" | null;
 }) {
-  const base = "flex items-center gap-2 px-4 py-1.5 border-b border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900 text-xs";
+  const base =
+    "shrink-0 flex items-center gap-2 px-4 py-1.5 border-b border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900 text-xs";
 
   if (fetchPhase === "idle" && matchState === "MENUS") {
     return (
@@ -245,7 +249,7 @@ function StatusStrip({
       ? Math.round((mmrProgress.fetched / mmrProgress.total) * 100)
       : 0;
     return (
-      <div className="flex flex-col gap-1 px-4 py-1.5 border-b border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900">
+      <div className="flex shrink-0 flex-col gap-1 px-4 py-1.5 border-b border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900">
         <div className="flex items-center justify-between text-xs">
           <span className="text-blue-500 dark:text-blue-400 flex items-center gap-2">
             <span className="w-1.5 h-1.5 rounded-full bg-blue-500 dark:bg-blue-400 inline-block animate-pulse" />
@@ -282,9 +286,25 @@ function StatusStrip({
 }
 
 // KDA and WIN% removed -- WinProbabilityFooter still uses playerStats internally
-const MATCH_TABLE_GRID = "36px minmax(160px,1fr) 110px 100px 54px 54px";
+const MATCH_TABLE_GRID =
+  "40px minmax(88px,2fr) minmax(52px,1fr) minmax(48px,1fr) minmax(2.75rem,0.85fr) minmax(2.75rem,0.85fr) minmax(2.5rem,0.75fr)";
+
+function headshotPctTextClass(pct: number): string {
+  if (pct < 15) return "text-red-500 dark:text-red-400";
+  if (pct <= 22) return "text-yellow-600 dark:text-yellow-500";
+  return "text-green-600 dark:text-green-400";
+}
 
 function MatchStatColumns({ stats, loading }: { stats: PlayerMatchStats | undefined; loading: boolean }) {
+  const hsEl =
+    loading ? (
+      <span className="animate-pulse text-gray-400 dark:text-gray-500">...</span>
+    ) : stats ? (
+      <span className={headshotPctTextClass(stats.headshotPct)}>{stats.headshotPct.toFixed(1)}%</span>
+    ) : (
+      <span className="text-gray-400 dark:text-gray-600">—</span>
+    );
+
   return (
     <>
       <div className="text-xs tabular-nums text-right text-gray-700 dark:text-gray-300">
@@ -296,6 +316,7 @@ function MatchStatColumns({ stats, loading }: { stats: PlayerMatchStats | undefi
           <span className="text-gray-400 dark:text-gray-600">—</span>
         )}
       </div>
+      <div className="text-xs tabular-nums text-right">{hsEl}</div>
       <div className="text-[10px] tabular-nums text-right text-gray-400 dark:text-gray-500 leading-tight">
         {!loading && stats ? <span>{stats.matchesPlayed}</span> : null}
       </div>
@@ -406,9 +427,14 @@ export default function App() {
 
   const isDark = theme === "dark";
 
+  const henrikKeyMissing = !settings.henrikApiKey.trim();
+  const ranksLoadedInMatch = pregamePlayers.some((p) => p.competitive_tier > 0);
+  const showHenrikKeyBanner =
+    henrikKeyMissing && (pregamePlayers.length === 0 || !ranksLoadedInMatch);
+
   return (
     <div
-      className="min-h-screen bg-[#0f1117] text-gray-900 dark:text-white"
+      className="flex h-full min-h-0 w-full flex-col overflow-hidden bg-[#0f1117] text-gray-900 dark:text-white"
       style={{ fontFamily: "'Din Next', 'Rajdhani', sans-serif", opacity: settings.opacity }}
     >
       {showSettings && (
@@ -420,10 +446,13 @@ export default function App() {
       )}
 
       {/* Header */}
-      <div className="border-b border-gray-200 dark:border-gray-800 px-6 py-3 flex items-center justify-between bg-white dark:bg-gray-950">
+      <div className="shrink-0 border-b border-gray-200 dark:border-gray-800 px-6 py-3 flex items-center justify-between bg-white dark:bg-gray-950">
         <div className="flex items-center gap-3">
           <div className="w-1 h-6 bg-red-500" />
-          <h1 className="text-xl font-black tracking-widest uppercase text-gray-900 dark:text-white">BurgerLens</h1>
+          <div className="flex items-baseline gap-2">
+            <h1 className="text-xl font-black tracking-widest uppercase text-gray-900 dark:text-white">BurgerLens</h1>
+            <span className="text-xs text-gray-500 tabular-nums">v{APP_VERSION}</span>
+          </div>
         </div>
         <div className="flex gap-2 items-center">
           <button
@@ -443,7 +472,7 @@ export default function App() {
           </button>
           <button
             type="button"
-            onClick={fetchLobby}
+            onClick={() => fetchLobby({ resetHenrikSession: true })}
             disabled={loading}
             className="px-4 py-1.5 text-sm font-bold uppercase tracking-wider border border-red-400 dark:border-red-500 text-red-500 dark:text-red-400 hover:bg-red-500 hover:text-white disabled:opacity-40 transition-colors"
           >
@@ -466,27 +495,27 @@ export default function App() {
         </div>
       </div>
 
-      {!settings.henrikApiKey.trim() && (
+      {showHenrikKeyBanner && (
         <div
-          className="mx-6 mt-3 rounded border border-amber-600/50 bg-amber-50 dark:bg-amber-950/40 px-4 py-2 text-xs text-amber-700 dark:text-amber-200/95"
+          className="shrink-0 mx-6 mt-3 rounded border border-yellow-600/60 bg-yellow-950/50 px-4 py-2 text-xs text-yellow-100"
           role="status"
         >
-          <span className="font-semibold text-amber-800 dark:text-amber-100">Henrik API key missing.</span>{" "}
-          Competitive ranks and match history will not load until you add your key in{" "}
+          Henrik API key missing -- add it in Settings to see ranks and stats.{" "}
           <button
             type="button"
-            className="underline font-semibold text-amber-800 dark:text-amber-100 hover:text-amber-900 dark:hover:text-white"
+            className="underline font-semibold text-yellow-50 hover:text-white"
             onClick={() => setShowSettings(true)}
           >
             Settings
           </button>
-          .
         </div>
       )}
 
-      <StatusStrip fetchPhase={fetchPhase} mmrProgress={mmrProgress} matchState={matchState} />
+      <div className="shrink-0">
+        <StatusStrip fetchPhase={fetchPhase} mmrProgress={mmrProgress} matchState={matchState} />
+      </div>
 
-      <div className="px-6 py-4 space-y-6">
+      <div className="min-h-0 min-w-0 flex-1 overflow-auto px-6 py-4 space-y-6">
         {error && (
           <p className="text-yellow-500 dark:text-yellow-400 text-xs uppercase tracking-wider">{error}</p>
         )}
@@ -501,7 +530,7 @@ export default function App() {
               <span className="text-xs text-gray-400 dark:text-gray-600">{pregamePlayers.length} players</span>
             </div>
 
-            <div className="border border-gray-200 dark:border-gray-800 overflow-hidden rounded">
+            <div className="min-w-0 w-full border border-gray-200 dark:border-gray-800 overflow-hidden rounded">
               {/* Rank summary strip */}
               {(() => {
                 const ranked = pregamePlayers.filter(p => p.competitive_tier > 0);
@@ -527,6 +556,7 @@ export default function App() {
                 <div>Rank</div>
                 <div>Peak</div>
                 <div className="text-right">ACS</div>
+                <div className="text-right">HS%</div>
                 <div className="text-right">Games</div>
               </div>
 

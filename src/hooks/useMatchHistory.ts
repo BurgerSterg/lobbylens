@@ -8,8 +8,18 @@ let cachedHistory: MatchRecord[] | null = null;
 
 export async function loadHistory(): Promise<MatchRecord[]> {
   if (cachedHistory) return cachedHistory;
-  cachedHistory = await invoke<MatchRecord[]>("load_match_history");
-  return cachedHistory;
+  try {
+    const raw = await invoke<MatchRecord[]>("load_match_history");
+    if (!Array.isArray(raw)) {
+      cachedHistory = [];
+      return [];
+    }
+    cachedHistory = raw;
+    return raw;
+  } catch {
+    cachedHistory = [];
+    return [];
+  }
 }
 
 /** Stats vs another player (all stored history rows where they appear on either side). */

@@ -1,7 +1,9 @@
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::time::Duration;
 use std::{fs, path::PathBuf};
+use tokio::time::sleep;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Lockfile {
@@ -49,7 +51,7 @@ pub struct MmrCacheEntry {
     pub fetched_at: i64,
 }
 
-fn parse_lockfile() -> Result<Lockfile, String> {
+fn try_parse_lockfile_once() -> Result<Lockfile, String> {
     let local = std::env::var("LOCALAPPDATA")
         .map_err(|_| "LOCALAPPDATA env var not found".to_string())?;
 
@@ -72,6 +74,20 @@ fn parse_lockfile() -> Result<Lockfile, String> {
         password: parts[3].to_string(),
         protocol: parts[4].to_string(),
     })
+}
+
+async fn parse_lockfile_with_retry() -> Result<Lockfile, String> {
+    for attempt in 1..=3 {
+        match try_parse_lockfile_once() {
+            Ok(lf) => return Ok(lf),
+            Err(_e) => {
+                if attempt < 3 {
+                    sleep(Duration::from_millis(1000)).await;
+                }
+            }
+        }
+    }
+    Err("Lockfile not found after 3 attempts -- is Valorant running?".to_string())
 }
 
 fn decode_private(private_b64: &str) -> serde_json::Value {
@@ -97,7 +113,7 @@ mod commands {
 
     #[tauri::command]
     pub async fn get_presences() -> Result<Vec<PlayerPresence>, String> {
-        let lf = parse_lockfile()?;
+        let lf = parse_lockfile_with_retry().await?;
 
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
@@ -149,7 +165,7 @@ mod commands {
 
     #[tauri::command]
     pub async fn get_local_player() -> Result<serde_json::Value, String> {
-        let lf = parse_lockfile()?;
+        let lf = parse_lockfile_with_retry().await?;
 
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
@@ -243,7 +259,7 @@ mod commands {
 
     #[tauri::command]
     pub async fn get_auth_tokens() -> Result<serde_json::Value, String> {
-        let lf = parse_lockfile()?;
+        let lf = parse_lockfile_with_retry().await?;
 
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
@@ -409,7 +425,13 @@ mod commands {
             return Ok(vec![]);
         }
         let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&content).map_err(|e| e.to_string())
+        match serde_json::from_str::<Vec<MatchRecord>>(&content) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                eprintln!("match_history.json deserialize failed: {e}");
+                Ok(vec![])
+            }
+        }
     }
 
     #[tauri::command]
@@ -433,7 +455,14 @@ mod commands {
             return Ok(std::collections::HashMap::new());
         }
         let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&content).map_err(|e| e.to_string())
+        match serde_json::from_str::<std::collections::HashMap<String, super::MmrCacheEntry>>(&content)
+        {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                eprintln!("mmr_cache.json deserialize failed: {e}");
+                Ok(std::collections::HashMap::new())
+            }
+        }
     }
 
     #[tauri::command]

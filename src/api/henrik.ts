@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { MmrDiskCacheEntry, MmrEntry, PlayerMatchStats } from "../types";
 
-const MMR_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const MMR_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 const PLAYER_STATS_CACHE_TTL_MS = 10 * 60 * 1000;
 
 /** Recent-match aggregates keyed by PUUID; refreshed every {@link PLAYER_STATS_CACHE_TTL_MS}. */
@@ -11,15 +11,38 @@ const playerStatsCachedAt = new Map<string, number>();
 let diskMmrCache: Record<string, MmrDiskCacheEntry> = {};
 let diskMmrCacheLoaded = false;
 
+/** Missing / blank tier name while ranked, or unranked row with no label — drop so Henrik is hit again. */
+function diskMmrEntryInvalid(entry: MmrDiskCacheEntry | undefined): boolean {
+  if (!entry || typeof entry !== "object") return true;
+  const tn =
+    entry.tierName === undefined || entry.tierName === null ? "" : String(entry.tierName).trim();
+  const tier = Number(entry.tier) || 0;
+  if (tier === 0) return tn === "";
+  return tn === "";
+}
+
 export async function initMmrDiskCache(): Promise<void> {
-  if (diskMmrCacheLoaded) return;
   try {
-    const data = await invoke<Record<string, MmrDiskCacheEntry>>("load_mmr_cache");
-    diskMmrCache = data && typeof data === "object" ? data : {};
+    if (diskMmrCacheLoaded) return;
+    try {
+      const data = await invoke<Record<string, MmrDiskCacheEntry>>("load_mmr_cache");
+      diskMmrCache = data && typeof data === "object" ? data : {};
+    } catch {
+      diskMmrCache = {};
+    }
+    let removed = false;
+    for (const id of Object.keys(diskMmrCache)) {
+      if (diskMmrEntryInvalid(diskMmrCache[id])) {
+        delete diskMmrCache[id];
+        removed = true;
+      }
+    }
+    if (removed) void persistMmrCache();
+    diskMmrCacheLoaded = true;
   } catch {
     diskMmrCache = {};
+    diskMmrCacheLoaded = true;
   }
-  diskMmrCacheLoaded = true;
 }
 
 async function persistMmrCache(): Promise<void> {
@@ -196,6 +219,15 @@ async function fetchHenrikMmrForPlayerImpl(
   onResolved: ((puuid: string, entry: MmrEntry) => void) | undefined,
   isScheduled429Retry: boolean,
 ): Promise<MmrEntry> {
+  if (!henrikApiKey.trim()) {
+    return {
+      competitive_tier: 0,
+      peak_tier: 0,
+      rank_icon: null,
+      peak_rank_icon: null,
+    };
+  }
+
   await initMmrDiskCache();
 
   const maybeNotifyRetrySuccess = (entry: MmrEntry) => {
@@ -210,10 +242,15 @@ async function fetchHenrikMmrForPlayerImpl(
 
   const disk = diskMmrCache[puuid];
   if (disk && Date.now() - disk.fetchedAt < MMR_CACHE_TTL_MS) {
-    const entry = diskEntryToMmr(disk, rankMap);
-    mmrByPuuid[puuid] = entry;
-    maybeNotifyRetrySuccess(entry);
-    return entry;
+    if (diskMmrEntryInvalid(disk)) {
+      delete diskMmrCache[puuid];
+      void persistMmrCache();
+    } else {
+      const entry = diskEntryToMmr(disk, rankMap);
+      mmrByPuuid[puuid] = entry;
+      maybeNotifyRetrySuccess(entry);
+      return entry;
+    }
   }
 
   const inflight = mmrFetchByPuuid.get(puuid);
@@ -306,6 +343,8 @@ export function identityAccountLevelValue(v: number | null | undefined): number 
 }
 
 export async function fetchHenrikAccountLevel(puuid: string, henrikApiKey: string): Promise<number | undefined> {
+  if (!henrikApiKey.trim()) return undefined;
+
   const hit = resolvedAccountLevels[puuid];
   if (hit != null) return hit > 0 ? hit : undefined;
 
@@ -380,9 +419,16 @@ export async function fetchPlayerRecentStats(
   henrikApiKey: string,
 ): Promise<PlayerMatchStats | null> {
   try {
+    if (!henrikApiKey.trim()) return null;
+
     const cachedAt = playerStatsCachedAt.get(puuid);
     const cached = playerStatsCache.get(puuid);
-    if (cached != null && cachedAt != null && Date.now() - cachedAt < PLAYER_STATS_CACHE_TTL_MS) {
+    if (
+      cached != null &&
+      cachedAt != null &&
+      typeof cached.headshotPct === "number" &&
+      Date.now() - cachedAt < PLAYER_STATS_CACHE_TTL_MS
+    ) {
       return cached;
     }
 
@@ -423,6 +469,8 @@ export async function fetchPlayerRecentStats(
     let matchesPlayed = 0;
     let scoreSum = 0;
     let roundsSum = 0;
+    let hsPctSum = 0;
+    let hsPctMatches = 0;
 
     for (const raw of filtered) {
       const m = raw as {
@@ -460,6 +508,15 @@ export async function fetchPlayerRecentStats(
         (team === "red" && m.teams?.red?.has_won === true) ||
         (team === "blue" && m.teams?.blue?.has_won === true);
       if (won) wins++;
+
+      const head = Number(st.headshots ?? 0);
+      const body = Number(st.bodyshots ?? 0);
+      const leg = Number(st.legshots ?? 0);
+      const shotDenom = head + body + leg;
+      if (shotDenom > 0 && [head, body, leg].every((n) => Number.isFinite(n))) {
+        hsPctSum += (head / shotDenom) * 100;
+        hsPctMatches += 1;
+      }
     }
 
     if (matchesPlayed === 0) return null;
@@ -467,6 +524,8 @@ export async function fetchPlayerRecentStats(
     const winRate = wins / matchesPlayed;
     const kda = (kills + assists) / Math.max(deaths, 1);
     const avgACS = roundsSum > 0 ? scoreSum / roundsSum : 0;
+    const headshotPct =
+      hsPctMatches > 0 ? Math.round((hsPctSum / hsPctMatches) * 10) / 10 : 0;
 
     const out: PlayerMatchStats = {
       puuid,
@@ -477,6 +536,7 @@ export async function fetchPlayerRecentStats(
       winRate,
       matchesPlayed,
       avgACS,
+      headshotPct,
     };
     playerStatsCache.set(puuid, out);
     playerStatsCachedAt.set(puuid, Date.now());
@@ -496,6 +556,7 @@ export function resetHenrikLobbyCaches(): void {
   mmrRetryMetaByPuuid.clear();
   mmrByPuuid = {};
   mmrFetchByPuuid.clear();
+  cachedMMR.current = null;
   for (const k of Object.keys(resolvedIncognitoNames)) delete resolvedIncognitoNames[k];
   for (const k of Object.keys(resolvedAccountLevels)) delete resolvedAccountLevels[k];
   accountLevelFetchByPuuid.clear();

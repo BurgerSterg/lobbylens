@@ -4,6 +4,7 @@ export interface Settings {
   region: string;
   alwaysOnTop: boolean;
   opacity: number;
+  soundEnabled: boolean;
 }
 
 export interface PlayerPresence {
@@ -26,6 +27,8 @@ export interface PlayerMatchStats {
   winRate: number;
   matchesPlayed: number;
   avgACS: number;
+  /** 0–100, averaged per-match HS / (HS + body + leg). */
+  headshotPct: number;
 }
 
 export interface PregamePlayer {

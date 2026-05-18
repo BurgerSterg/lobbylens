@@ -111,6 +111,20 @@ export default function SettingsPanel({ settings, onClose, onChange }: Props) {
             />
           </div>
 
+          {/* Lobby notification sound */}
+          <div className="flex items-center justify-between">
+            <label className="text-xs font-bold uppercase tracking-wider text-gray-400">
+              Lobby load sound
+            </label>
+            <button
+              type="button"
+              onClick={() => update({ soundEnabled: !(local.soundEnabled ?? true) })}
+              className={`w-12 h-6 relative transition-colors ${(local.soundEnabled ?? true) ? "bg-red-600" : "bg-gray-700"}`}
+            >
+              <div className={`absolute top-1 w-4 h-4 bg-white transition-all ${(local.soundEnabled ?? true) ? "left-7" : "left-1"}`} />
+            </button>
+          </div>
+
           {/* Always on Top */}
           <div className="flex items-center justify-between">
             <label className="text-xs font-bold uppercase tracking-wider text-gray-400">

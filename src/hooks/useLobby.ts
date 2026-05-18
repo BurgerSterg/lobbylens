@@ -17,6 +17,7 @@ import {
   resetHenrikLobbyCaches,
   resolvedAccountLevels,
 } from "../api/henrik";
+import { playLobbyLoadedChime } from "../utils/sound";
 import {
   getAuthTokens,
   getCoregameMatchExternal,
@@ -250,6 +251,8 @@ export function useLobby(settings: Settings) {
   } | null>(null);
   const statsMatchIdRef = useRef<string | null>(null);
   const statsKickStartedRef = useRef<string | null>(null);
+  const consecutiveConnectionFailuresRef = useRef(0);
+  const playedLobbyLoadedChimeForMatchRef = useRef<string | null>(null);
 
   useEffect(() => {
     startDetecting();
@@ -270,8 +273,52 @@ export function useLobby(settings: Settings) {
     })();
   }, [localPuuid, settings.henrikApiKey, settings.region]);
 
+  useEffect(() => {
+    const mid = statsMatchIdRef.current;
+    if (!mid) {
+      playedLobbyLoadedChimeForMatchRef.current = null;
+      return;
+    }
+    if (fetchPhase !== "done") return;
+    if (!settings.soundEnabled) return;
+    if (pregamePlayers.length === 0) return;
+    if (playedLobbyLoadedChimeForMatchRef.current === mid) return;
+    playedLobbyLoadedChimeForMatchRef.current = mid;
+    playLobbyLoadedChime();
+  }, [fetchPhase, settings.soundEnabled, pregamePlayers.length]);
+
+  function resetValorantTransportStreak() {
+    consecutiveConnectionFailuresRef.current = 0;
+  }
+
+  /** Transport failures toward disconnect threshold; returns true when lobby was fully cleared. */
+  function onValorantTransportFailure(): boolean {
+    consecutiveConnectionFailuresRef.current += 1;
+    if (consecutiveConnectionFailuresRef.current < 10) return false;
+    consecutiveConnectionFailuresRef.current = 0;
+    setMatchState(null);
+    setPlayers([]);
+    setPregamePlayers([]);
+    setMapName("");
+    setServerName("");
+    accumulatedPartyIdsByPuuid = {};
+    for (const k of Object.keys(knownPartyMembers)) delete knownPartyMembers[k];
+    statsMatchIdRef.current = null;
+    statsKickStartedRef.current = null;
+    setPlayerStats({});
+    setPlayerStatLoading({});
+    resetHenrikLobbyCaches();
+    setError("Lost connection to Valorant -- is the game still running?");
+    isFetchingRef.current = false;
+    return true;
+  }
+
   async function flushPendingMatch(myPuuid: string) {
     if (!pendingMatchRef.current || !myPuuid) return;
+    if (!settings.henrikApiKey.trim()) {
+      pendingMatchRef.current = null;
+      return;
+    }
     const pending = pendingMatchRef.current;
     pendingMatchRef.current = null;
     await flushPendingMatchToHistory(pending, myPuuid, settings.region, settings.henrikApiKey);
@@ -287,18 +334,27 @@ export function useLobby(settings: Settings) {
         setMatchState("PREGAME");
         return;
       } catch (e) {
-        if (isSilentTransportError(e)) return;
+        if (isSilentTransportError(e)) {
+          void onValorantTransportFailure();
+          return;
+        }
       }
       try {
         await getCoregameMatchIdExternal(session.puuid, tokens, region);
         setMatchState("INGAME");
         return;
       } catch (e) {
-        if (isSilentTransportError(e)) return;
+        if (isSilentTransportError(e)) {
+          void onValorantTransportFailure();
+          return;
+        }
       }
       setMatchState("MENUS");
     } catch (e) {
-      if (isSilentTransportError(e)) return;
+      if (isSilentTransportError(e)) {
+        void onValorantTransportFailure();
+        return;
+      }
       setMatchState(null);
     }
   }
@@ -328,8 +384,9 @@ export function useLobby(settings: Settings) {
     }
   }
 
-  async function fetchLobby() {
+  async function fetchLobby(opts?: { resetHenrikSession?: boolean }) {
     if (isFetchingRef.current) return;
+    if (opts?.resetHenrikSession) resetHenrikLobbyCaches();
     isFetchingRef.current = true;
     setLoading(true);
     setError(null);
@@ -365,6 +422,7 @@ export function useLobby(settings: Settings) {
 
       result = await getPresences();
       mergePartyIdsFromPresences(result);
+      resetValorantTransportStreak();
       setFetchPhase("loading_players");
 
       const newPartyIds = [
@@ -592,7 +650,7 @@ export function useLobby(settings: Settings) {
             matchId = await getCoregameMatchIdExternal(puuid, tokens, region);
           } catch (e) {
             if (isSilentTransportError(e)) {
-              isFetchingRef.current = false;
+              void onValorantTransportFailure();
               return;
             }
             throw e;
@@ -608,7 +666,7 @@ export function useLobby(settings: Settings) {
             match = await getCoregameMatchExternal(matchId, tokens, region);
           } catch (e) {
             if (isSilentTransportError(e)) {
-              isFetchingRef.current = false;
+              void onValorantTransportFailure();
               return;
             }
             throw e;
@@ -803,7 +861,7 @@ export function useLobby(settings: Settings) {
         })),
       );
     } catch (e) {
-      isFetchingRef.current = false;
+      if (isSilentTransportError(e)) void onValorantTransportFailure();
       setError(String(e));
       const myState = result.find((p) => p.puuid === puuid)?.session_state?.toUpperCase();
       if (myState === "MENUS" || myState === "MENU") {
