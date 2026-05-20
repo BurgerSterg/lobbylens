@@ -124,14 +124,21 @@ export async function backfillMatchHistory(
   return records;
 }
 
+/** Result of attempting to append the pending match after returning to menus. */
+export type FlushPendingMatchResult = {
+  appended: boolean;
+  won?: boolean;
+  kda?: number;
+};
+
 /** Append the current match to local history once Henrik has the match payload (post-game). */
 export async function flushPendingMatchToHistory(
   pending: PendingMatchFlush | null,
   myPuuid: string,
   region: string,
   henrikApiKey: string,
-): Promise<void> {
-  if (!pending || !myPuuid) return;
+): Promise<FlushPendingMatchResult> {
+  if (!pending || !myPuuid) return { appended: false };
   try {
     const shard = henrikMatchHistoryShard(region);
     const res = await henrikFetch(
@@ -160,6 +167,11 @@ export async function flushPendingMatchToHistory(
           if (d != null && Number.isFinite(Number(d))) kda.deaths = Number(d);
           if (a != null && Number.isFinite(Number(a))) kda.assists = Number(a);
 
+          const killsNum = kda.kills ?? 0;
+          const deathsNum = Math.max(kda.deaths ?? 0, 1);
+          const assistsNum = kda.assists ?? 0;
+          const matchKda = (killsNum + assistsNum) / deathsNum;
+
           history.unshift({
             match_id: pending.matchId,
             map: pending.map,
@@ -171,10 +183,13 @@ export async function flushPendingMatchToHistory(
             ...kda,
           });
           await saveHistory(history);
+          return { appended: true, won, kda: matchKda };
         }
+        return { appended: false };
       }
     }
   } catch {}
+  return { appended: false };
 }
 
 export function summarizePlayer(

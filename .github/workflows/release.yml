@@ -30,3 +30,4 @@ jobs:
           releaseName: BurgerLens ${{ github.ref_name }}
           releaseDraft: false
           prerelease: false
+          updaterJsonPreferNsis: true

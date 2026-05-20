@@ -1,8 +1,10 @@
 import { useState, useEffect, type ReactNode } from "react";
+import anyAscii from "any-ascii";
 import { useLobby, calculateWinProbability } from "./hooks/useLobby";
 import type {
   FetchPhase,
   MatchRecord,
+  PersonalStats,
   PlayerPresence,
   PlayerMatchStats,
   PregamePlayer,
@@ -10,11 +12,20 @@ import type {
 } from "./types";
 import { getMatchStatsAgainstPlayerFromHistory } from "./hooks/useMatchHistory";
 import SettingsPanel from "./components/Settings";
-import { loadSettings } from "./store/settings";
 import { useUpdater } from "./hooks/useUpdater";
+import { fetchValorantRankSmallIconsByTier } from "./api/henrik";
+import {
+  formatPeakSeasonSubline,
+  formatSeasonCompactLine,
+  getSeasonInfo,
+} from "./utils/seasonMap";
+import { loadSettings, saveSettings } from "./store/settings";
+import { applyDocumentDarkClass, readStoredDarkMode } from "./theme";
+import { version as APP_VERSION } from "../package.json";
 
-/** Keep in sync with `src-tauri/tauri.conf.json` → `version`. */
-const APP_VERSION = "0.3.1";
+function hasNonAscii(str: string): boolean {
+  return /[^\x00-\x7F]/.test(str);
+}
 
 const RANK_NAMES: Record<number, string> = {
   0: "Unranked",
@@ -51,6 +62,19 @@ const RANK_BG: Record<number, string> = {
   21: "rgba(5,150,105,0.15)", 22: "rgba(5,150,105,0.15)", 23: "rgba(5,150,105,0.15)",
   24: "rgba(220,38,38,0.18)", 25: "rgba(220,38,38,0.18)", 26: "rgba(220,38,38,0.18)",
   27: "rgba(245,158,11,0.18)",
+};
+
+/** Short labels for personal card current rank (aligned with {@link RANK_NAMES} tier IDs). */
+const RANK_COMPACT: Record<number, string> = {
+  3: "I1", 4: "I2", 5: "I3",
+  6: "B1", 7: "B2", 8: "B3",
+  9: "S1", 10: "S2", 11: "S3",
+  12: "G1", 13: "G2", 14: "G3",
+  15: "P1", 16: "P2", 17: "P3",
+  18: "D1", 19: "D2", 20: "D3",
+  21: "A1", 22: "A2", 23: "A3",
+  24: "IM1", 25: "IM2", 26: "IM3",
+  27: "R",
 };
 
 function getRankGlow(tier: number | null): string {
@@ -210,7 +234,7 @@ function StatusStrip({
   matchState: "MENUS" | "PREGAME" | "INGAME" | null;
 }) {
   const base =
-    "shrink-0 flex items-center gap-2 px-4 py-1.5 border-b border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900 text-xs";
+    "shrink-0 flex items-center gap-2 px-4 py-1.5 mx-3 my-1 rounded-md border border-gray-200 dark:border-gray-700/60 bg-gray-50 dark:bg-gray-900 text-xs";
 
   if (fetchPhase === "idle" && matchState === "MENUS") {
     return (
@@ -249,7 +273,7 @@ function StatusStrip({
       ? Math.round((mmrProgress.fetched / mmrProgress.total) * 100)
       : 0;
     return (
-      <div className="flex shrink-0 flex-col gap-1 px-4 py-1.5 border-b border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900">
+      <div className="flex shrink-0 flex-col gap-1 px-4 py-1.5 mx-3 my-1 rounded-md border border-gray-200 dark:border-gray-700/60 bg-gray-50 dark:bg-gray-900">
         <div className="flex items-center justify-between text-xs">
           <span className="text-blue-500 dark:text-blue-400 flex items-center gap-2">
             <span className="w-1.5 h-1.5 rounded-full bg-blue-500 dark:bg-blue-400 inline-block animate-pulse" />
@@ -285,6 +309,142 @@ function StatusStrip({
   return null;
 }
 
+function PersonalCardSkeleton() {
+  return (
+    <div
+      className="w-full h-[140px] shrink-0 rounded-xl border border-gray-300/70 dark:border-gray-700/50 bg-gray-200 dark:bg-gray-800 animate-pulse"
+      aria-hidden
+    />
+  );
+}
+
+function PersonalCard({
+  stats,
+  onRefresh,
+}: {
+  stats: PersonalStats;
+  onRefresh: () => void;
+}) {
+  const [rankIcons, setRankIcons] = useState<Record<number, string>>({});
+  useEffect(() => {
+    void fetchValorantRankSmallIconsByTier().then(setRankIcons);
+  }, []);
+
+  const rankIconUrl = stats.currentTier > 0 ? (rankIcons[stats.currentTier] ?? "") : "";
+  const peakIconUrl = stats.peakTier > 0 ? (rankIcons[stats.peakTier] ?? "") : "";
+  const peakSeasonLine = formatPeakSeasonSubline(stats.peakSeasonShort);
+
+  return (
+    <div className="relative h-[160px] rounded-xl overflow-hidden border border-gray-700/40 mx-3 mb-3 flex group">
+
+      {/* LEFT: Card art panel -- fixed width, sharp at near-native resolution */}
+      <div className="relative w-52 flex-shrink-0 overflow-hidden">
+        {stats.playerCardUrl ? (
+          <img
+            src={stats.playerCardUrl}
+            alt=""
+            className="absolute inset-0 w-full h-full object-cover object-top"
+            draggable={false}
+          />
+        ) : (
+          <div className="absolute inset-0 bg-gray-800" />
+        )}
+        {/* Subtle right-edge fade into the stats panel */}
+        <div className="absolute inset-y-0 right-0 w-8 bg-gradient-to-r from-transparent to-gray-900" />
+      </div>
+
+      {/* RIGHT: Stats panel */}
+      <div className="flex-1 bg-gray-900 flex flex-col justify-between px-5 py-4 min-w-0">
+
+        {/* Refresh button -- hover only, top right */}
+        <button
+          type="button"
+          onClick={() => { void onRefresh(); }}
+          className="absolute top-3 right-3 z-20 text-gray-500 hover:text-gray-200 opacity-0 group-hover:opacity-100 transition-opacity text-base"
+          title="Refresh stats"
+        >↻</button>
+
+        {/* TOP: Name row */}
+        <div className="flex flex-col gap-0.5">
+          <div className="flex items-baseline gap-2 min-w-0">
+            <span className="text-xl font-bold text-white truncate">
+              {stats.name}
+            </span>
+            <span className="text-sm text-gray-400 flex-shrink-0">#{stats.tag}</span>
+            <span className="text-xs text-gray-500 flex-shrink-0">Lv {stats.accountLevel > 0 ? stats.accountLevel : "—"}</span>
+          </div>
+          {/* Thin accent line under name */}
+          <div className="h-px w-16 bg-gradient-to-r from-red-500/60 to-transparent mt-1" />
+        </div>
+
+        {/* MIDDLE: Rank + Peak side by side */}
+        <div className="flex items-center gap-8">
+          {/* Current rank */}
+          <div className="flex flex-col gap-0.5">
+            <span className="text-[10px] text-gray-500 uppercase tracking-widest">Rank</span>
+            <div className="flex items-center gap-1.5">
+              {rankIconUrl && <img src={rankIconUrl} className="w-6 h-6 object-contain" alt="" />}
+              <span className="text-white font-semibold text-sm">
+                {stats.currentTier > 0 ? (RANK_COMPACT[stats.currentTier] ?? stats.currentTierName) : "Unranked"}
+              </span>
+              {stats.rankingInTier > 0 && (
+                <span className="text-gray-400 text-xs">· {stats.rankingInTier} RR</span>
+              )}
+            </div>
+          </div>
+
+          {/* Divider */}
+          <div className="w-px h-8 bg-gray-700 flex-shrink-0" />
+
+          {/* Peak rank */}
+          <div className="flex flex-col gap-0.5">
+            <span className="text-[10px] text-gray-500 uppercase tracking-widest">Peak</span>
+            <div className="flex items-center gap-1.5">
+              {peakIconUrl && <img src={peakIconUrl} className="w-6 h-6 object-contain" alt="" />}
+              <span className="text-white font-semibold text-sm">
+                {stats.peakTier > 0 ? (stats.peakTierName || RANK_NAMES[stats.peakTier] || "—") : "—"}
+              </span>
+            </div>
+            {stats.peakTier > 0 && peakSeasonLine ? (
+              <span className="text-[10px] text-gray-500">{peakSeasonLine}</span>
+            ) : null}
+          </div>
+        </div>
+
+        {/* BOTTOM: Act record + KDA + HS% + Session */}
+        <div className="flex items-center gap-3 text-xs">
+          {stats.actWins > 0 || stats.actLosses > 0 ? (
+            <span className="flex gap-1">
+              <span className="text-green-400 font-medium">{stats.actWins}W</span>
+              <span className="text-gray-600">/</span>
+              <span className="text-red-400 font-medium">{stats.actLosses}L</span>
+            </span>
+          ) : (
+            <span className="text-gray-600">No act data</span>
+          )}
+          {stats.kda > 0 && (
+            <>
+              <span className="text-gray-600">·</span>
+              <span className="text-gray-400">{stats.kda.toFixed(2)} KDA</span>
+            </>
+          )}
+          {stats.headshotPct > 0 && (
+            <>
+              <span className="text-gray-600">·</span>
+              <span className="text-gray-400">{stats.headshotPct.toFixed(1)}% HS</span>
+            </>
+          )}
+          {stats.sessionMatches > 0 && (
+            <span className="text-gray-600 ml-auto">
+              Session: <span className="text-green-400">{stats.sessionWins}W</span>-<span className="text-red-400">{stats.sessionLosses}L</span>
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // KDA and WIN% removed -- WinProbabilityFooter still uses playerStats internally
 const MATCH_TABLE_GRID =
   "40px minmax(88px,2fr) minmax(52px,1fr) minmax(48px,1fr) minmax(2.75rem,0.85fr) minmax(2.75rem,0.85fr) minmax(2.5rem,0.75fr)";
@@ -295,13 +455,48 @@ function headshotPctTextClass(pct: number): string {
   return "text-green-600 dark:text-green-400";
 }
 
-function MatchStatColumns({ stats, loading }: { stats: PlayerMatchStats | undefined; loading: boolean }) {
+function MatchStatColumns({
+  stats,
+  loading,
+  actWins,
+  actLosses,
+}: {
+  stats: PlayerMatchStats | undefined;
+  loading: boolean;
+  actWins?: number;
+  actLosses?: number;
+}) {
   const hsEl =
     loading ? (
       <span className="animate-pulse text-gray-400 dark:text-gray-500">...</span>
     ) : stats ? (
       <span className={headshotPctTextClass(stats.headshotPct)}>{stats.headshotPct.toFixed(1)}%</span>
     ) : (
+      <span className="text-gray-400 dark:text-gray-600">—</span>
+    );
+
+  const wlEl =
+    actWins !== undefined && actLosses !== undefined ? (() => {
+      const total = actWins + actLosses;
+      const pct = total > 0 ? Math.round((actWins / total) * 100) : null;
+      const pctClass =
+        pct == null ? ""
+          : pct >= 55 ? "text-green-400 dark:text-green-400"
+          : pct <= 45 ? "text-red-400 dark:text-red-400"
+          : "text-gray-400 dark:text-gray-500";
+      return (
+        <div className="flex flex-col items-end gap-0.5">
+          <span className="flex gap-1 text-xs">
+            <span className="text-green-500 dark:text-green-400 font-medium">{actWins}W</span>
+            <span className="text-gray-500 dark:text-gray-600">/</span>
+            <span className="text-red-500 dark:text-red-400 font-medium">{actLosses}L</span>
+          </span>
+          {pct != null && (
+            <span className={`text-[10px] font-medium ${pctClass}`}>{pct}%</span>
+          )}
+        </div>
+      );
+    })() : (
       <span className="text-gray-400 dark:text-gray-600">—</span>
     );
 
@@ -317,9 +512,7 @@ function MatchStatColumns({ stats, loading }: { stats: PlayerMatchStats | undefi
         )}
       </div>
       <div className="text-xs tabular-nums text-right">{hsEl}</div>
-      <div className="text-[10px] tabular-nums text-right text-gray-400 dark:text-gray-500 leading-tight">
-        {!loading && stats ? <span>{stats.matchesPlayed}</span> : null}
-      </div>
+      <div className="text-[10px] tabular-nums text-right leading-tight">{wlEl}</div>
     </>
   );
 }
@@ -355,18 +548,18 @@ function WinProbabilityFooter({
           <div className="bg-red-600 transition-[width] duration-700 ease-out" style={{ width: `${redWinPct}%` }} />
         </div>
         <div className="flex justify-between items-start gap-2 mt-1.5 text-xs">
-          <span className="text-blue-500 dark:text-blue-400 tabular-nums font-semibold">{blueWinPct.toFixed(1)}%</span>
-          <span className="text-[10px] text-gray-400 dark:text-gray-500 text-center flex-1">{confLabel}</span>
-          <span className="text-red-500 dark:text-red-400 tabular-nums font-semibold">{redWinPct.toFixed(1)}%</span>
+          <span className="text-blue-600 dark:text-blue-400 tabular-nums font-semibold">{blueWinPct.toFixed(1)}%</span>
+          <span className="text-[10px] text-gray-600 dark:text-gray-500 text-center flex-1">{confLabel}</span>
+          <span className="text-red-600 dark:text-red-400 tabular-nums font-semibold">{redWinPct.toFixed(1)}%</span>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="border-t border-gray-200 dark:border-gray-800 bg-gray-50/90 dark:bg-gray-950/90 px-4 py-3">
+    <div className="border-t border-gray-200 dark:border-gray-800 bg-gray-100/95 dark:bg-gray-950/90 px-4 py-3">
       {showCalculating && (
-        <div className="text-xs text-gray-400 dark:text-gray-500 animate-pulse mb-2">Calculating...</div>
+        <div className="text-xs text-gray-600 dark:text-gray-500 animate-pulse mb-2">Calculating...</div>
       )}
       {barEl}
     </div>
@@ -377,9 +570,9 @@ export default function App() {
   useUpdater();
   const [settings, setSettings] = useState<Settings>(() => loadSettings());
   const [showSettings, setShowSettings] = useState(false);
-  const [theme, setTheme] = useState<"dark" | "light">(() => {
-    return (localStorage.getItem("burgerlens-theme") as "dark" | "light") ?? "dark";
-  });
+  const [theme, setTheme] = useState<"dark" | "light">(() =>
+    readStoredDarkMode() ? "dark" : "light",
+  );
 
   const {
     players,
@@ -398,6 +591,9 @@ export default function App() {
     startPolling,
     stopPolling,
     loadHistory,
+    personalStats,
+    personalStatsLoading,
+    refreshPersonalStats,
   } = useLobby(settings);
 
   const [history, setHistory] = useState<MatchRecord[]>([]);
@@ -409,7 +605,14 @@ export default function App() {
   }, [loadHistory]);
 
   useEffect(() => {
+    const isDark = theme === "dark";
+    applyDocumentDarkClass(isDark);
     localStorage.setItem("burgerlens-theme", theme);
+    setSettings((prev) => {
+      const next = { ...prev, darkMode: isDark };
+      saveSettings(next);
+      return next;
+    });
   }, [theme]);
 
   function handleRetryRank(puuid: string) {
@@ -434,7 +637,7 @@ export default function App() {
 
   return (
     <div
-      className="flex h-full min-h-0 w-full flex-col overflow-hidden bg-[#0f1117] text-gray-900 dark:text-white"
+      className="flex h-full min-h-0 w-full flex-col overflow-hidden bg-gray-100 dark:bg-[#0f1117] text-gray-900 dark:text-white"
       style={{ fontFamily: "'Din Next', 'Rajdhani', sans-serif", opacity: settings.opacity }}
     >
       {showSettings && (
@@ -446,7 +649,7 @@ export default function App() {
       )}
 
       {/* Header */}
-      <div className="shrink-0 border-b border-gray-200 dark:border-gray-800 px-6 py-3 flex items-center justify-between bg-white dark:bg-gray-950">
+      <div className="shrink-0 border-b border-gray-200 dark:border-gray-700/50 px-6 py-3 flex items-center justify-between bg-white dark:bg-gray-950">
         <div className="flex items-center gap-3">
           <div className="w-1 h-6 bg-red-500" />
           <div className="flex items-baseline gap-2">
@@ -511,26 +714,33 @@ export default function App() {
         </div>
       )}
 
-      <div className="shrink-0">
-        <StatusStrip fetchPhase={fetchPhase} mmrProgress={mmrProgress} matchState={matchState} />
-      </div>
+      <StatusStrip fetchPhase={fetchPhase} mmrProgress={mmrProgress} matchState={matchState} />
 
-      <div className="min-h-0 min-w-0 flex-1 overflow-auto px-6 py-4 space-y-6">
+      <div className="min-h-0 min-w-0 flex-1 overflow-auto px-3 py-2 space-y-4 max-w-7xl mx-auto w-full">
         {error && (
           <p className="text-yellow-500 dark:text-yellow-400 text-xs uppercase tracking-wider">{error}</p>
         )}
 
+        {localPuuid && settings.henrikApiKey.trim() ? (
+          <>
+            {personalStatsLoading && <PersonalCardSkeleton />}
+            {!personalStatsLoading && personalStats && (
+              <PersonalCard stats={personalStats} onRefresh={refreshPersonalStats} />
+            )}
+          </>
+        ) : null}
+
         {pregamePlayers.length > 0 && (
           <div>
-            <div className="flex items-center gap-2 mb-3">
-              <span className="text-xs font-bold uppercase tracking-widest text-red-500 dark:text-red-400">In Game</span>
-              {mapName && <span className="text-xs text-gray-400 dark:text-gray-500 uppercase tracking-wider">— {mapName}</span>}
-              {serverName && <span className="text-xs text-gray-400 dark:text-gray-600 uppercase tracking-wider">{serverName}</span>}
+            <div className="flex items-center gap-2 mb-3 px-3 py-2 rounded bg-blue-50 border border-blue-100 dark:bg-transparent dark:border-transparent">
+              <span className="text-xs font-bold uppercase tracking-widest text-red-600 dark:text-red-400">In Game</span>
+              {mapName && <span className="text-xs text-gray-700 dark:text-gray-500 uppercase tracking-wider">— {mapName}</span>}
+              {serverName && <span className="text-xs text-gray-700 dark:text-gray-600 uppercase tracking-wider">{serverName}</span>}
               <div className="flex-1 h-px bg-gray-200 dark:bg-gray-800" />
               <span className="text-xs text-gray-400 dark:text-gray-600">{pregamePlayers.length} players</span>
             </div>
 
-            <div className="min-w-0 w-full border border-gray-200 dark:border-gray-800 overflow-hidden rounded">
+            <div className="min-w-0 w-full">
               {/* Rank summary strip */}
               {(() => {
                 const ranked = pregamePlayers.filter(p => p.competitive_tier > 0);
@@ -538,7 +748,7 @@ export default function App() {
                 const avg = Math.round(ranked.reduce((sum, p) => sum + p.competitive_tier, 0) / ranked.length);
                 const highest = Math.max(...ranked.map(p => p.competitive_tier));
                 return (
-                  <div className="flex gap-4 px-4 py-2 text-xs text-gray-400 dark:text-gray-500 border-b border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900/60">
+                  <div className="flex gap-4 px-4 py-2 text-xs text-gray-600 dark:text-gray-500 border-b border-gray-200 dark:border-gray-800 bg-gray-100 dark:bg-gray-900/60">
                     <span>Avg: <span className="text-gray-700 dark:text-gray-300">{RANK_NAMES[avg] ?? "Unranked"}</span></span>
                     <span>Highest: <span style={{ color: RANK_COLORS[highest] ?? "#9ca3af" }}>{RANK_NAMES[highest]}</span></span>
                     <span>Ranked: <span className="text-gray-700 dark:text-gray-300">{ranked.length}/{pregamePlayers.length}</span></span>
@@ -548,7 +758,7 @@ export default function App() {
 
               {/* Column headers */}
               <div
-                className="grid gap-x-3 px-4 py-2 text-xs font-bold uppercase tracking-widest text-gray-400 dark:text-gray-600 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900"
+                className="grid gap-x-3 px-4 py-2 text-xs font-semibold uppercase tracking-widest text-gray-700 dark:text-gray-400 border-b-2 border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 mb-1"
                 style={{ gridTemplateColumns: MATCH_TABLE_GRID }}
               >
                 <div />
@@ -557,7 +767,7 @@ export default function App() {
                 <div>Peak</div>
                 <div className="text-right">ACS</div>
                 <div className="text-right">HS%</div>
-                <div className="text-right">Games</div>
+                <div className="text-right">W/L</div>
               </div>
 
               {["Blue", "Red", "ally", "enemy", ""].map((team) => {
@@ -581,26 +791,20 @@ export default function App() {
                 return (
                   <div key={team || "other"}>
                     {showSectionHeader && (
-                      <div
-                        className={`text-xs font-bold uppercase tracking-widest px-4 py-1.5 border-b border-gray-200 dark:border-gray-800 flex items-center gap-2 ${
-                          isBlue
-                            ? "bg-blue-50/50 dark:bg-blue-950/10 border-l-2 border-l-blue-500"
-                            : isRed
-                              ? "bg-red-50/50 dark:bg-red-950/10 border-l-2 border-l-red-500"
-                              : "bg-gray-50 dark:bg-gray-900/20"
-                        }`}
-                      >
-                        <span className={
-                          isBlue ? "text-blue-500 dark:text-blue-400"
-                            : isRed ? "text-red-500 dark:text-red-400"
-                            : "text-gray-400"
-                        }>
+                      <div className="flex items-center gap-2 px-1 py-2 mt-2 mb-1">
+                        <div className={`flex-1 h-px ${isBlue ? "bg-blue-300 dark:bg-blue-900/50" : isRed ? "bg-red-300 dark:bg-red-900/50" : "bg-gray-200 dark:bg-gray-700"}`} />
+                        <span className={`text-xs font-bold uppercase tracking-widest ${
+                          isBlue ? "text-blue-600 dark:text-blue-400"
+                            : isRed ? "text-red-600 dark:text-red-400"
+                            : "text-gray-600 dark:text-gray-400"
+                        }`}>
                           {teamLabel}
                         </span>
+                        <div className={`flex-1 h-px ${isBlue ? "bg-blue-300 dark:bg-blue-900/50" : isRed ? "bg-red-300 dark:bg-red-900/50" : "bg-gray-200 dark:bg-gray-700"}`} />
                       </div>
                     )}
 
-                    {teamPlayers.map((p) => {
+                    {teamPlayers.map((p, playerIdx) => {
                       const matchStats =
                         localPuuid && history.length > 0
                           ? getMatchStatsAgainstPlayerFromHistory(history, localPuuid, p.puuid)
@@ -614,13 +818,18 @@ export default function App() {
                           ? "inset 2px 0 0 0 rgba(20, 184, 166, 0.4)"
                           : "";
                       const rowBoxShadow = [rankGlow, historyInset].filter(Boolean).join(", ") || undefined;
+                      const teamAccentColor = isBlue
+                        ? isDark ? "rgba(59,130,246,0.2)" : "rgba(59,130,246,0.3)"
+                        : isRed
+                          ? isDark ? "rgba(239,68,68,0.2)" : "rgba(239,68,68,0.3)"
+                          : "transparent";
                       const rowBorderLeft = p.party_color
                         ? `3px solid ${p.party_color}`
                         : p.puuid === localPuuid
                           ? "3px solid #ef4444"
                           : hasPriorMatches
                             ? "2px solid rgba(45, 212, 191, 0.45)"
-                            : "3px solid transparent";
+                            : `3px solid ${teamAccentColor}`;
 
                       const isRetrying = retryingPuuids.has(p.puuid);
                       const showRetry = (!p.competitive_tier || p.competitive_tier === 0) && !isRetrying;
@@ -631,14 +840,19 @@ export default function App() {
                           ? "rgba(239,68,68,0.35)"
                           : "rgba(156,163,175,0.2)";
 
+                      const rowTitle = hasNonAscii(p.game_name) ? p.game_name : undefined;
+
                       return (
                         <div
                           key={p.puuid}
+                          title={rowTitle}
                           onClick={() => setSelectedPuuid(p.puuid)}
-                          className={`cursor-pointer grid gap-x-4 px-4 py-2.5 items-center border-b border-gray-100 dark:border-gray-800 transition-colors ${
+                          className={`cursor-pointer grid gap-x-4 px-4 py-2.5 items-center rounded-lg border border-gray-300/70 dark:border-gray-700/50 mb-1 transition-colors ${
                             p.puuid === localPuuid
-                              ? "bg-red-50/60 dark:bg-red-950/30 hover:bg-red-50 dark:hover:bg-red-950/40"
-                              : "hover:bg-gray-50 dark:hover:bg-gray-800/50"
+                              ? "bg-red-50/50 dark:bg-red-900/20 hover:bg-red-50 dark:hover:bg-red-950/40"
+                              : playerIdx % 2 === 1
+                                ? "bg-gray-50/60 dark:bg-gray-800/40 hover:bg-gray-100/60 dark:hover:bg-gray-700/40"
+                                : "bg-white dark:bg-gray-800/40 hover:bg-gray-50 dark:hover:bg-gray-700/40"
                           }`}
                           style={{
                             gridTemplateColumns: MATCH_TABLE_GRID,
@@ -649,14 +863,14 @@ export default function App() {
                           {/* Agent icon - circular with team tint border */}
                           {p.agent_icon ? (
                             <div
-                              className="w-9 h-9 rounded-full overflow-hidden flex-shrink-0"
+                              className="w-10 h-10 rounded-full overflow-hidden flex-shrink-0"
                               style={{ border: `1.5px solid ${agentBorderColor}` }}
                             >
                               <img src={p.agent_icon} alt={p.agent_name} className="w-full h-full object-cover" />
                             </div>
                           ) : (
                             <div
-                              className="w-9 h-9 rounded-full bg-gray-200 dark:bg-gray-800 flex-shrink-0"
+                              className="w-10 h-10 rounded-full bg-gray-200 dark:bg-gray-800 flex-shrink-0"
                               style={{ border: `1.5px solid ${agentBorderColor}` }}
                             />
                           )}
@@ -664,9 +878,40 @@ export default function App() {
                           {/* Player name */}
                           <div className="min-w-0">
                             <div className="flex items-center gap-1.5 min-w-0">
-                              <span className="text-sm font-bold text-gray-900 dark:text-white truncate min-w-0 flex-1">
-                                {p.game_name}
-                              </span>
+                              {hasNonAscii(p.game_name) ? (
+                                <div className="min-w-0 flex-1 flex flex-col">
+                                  <span className="text-sm font-bold text-gray-900 dark:text-white truncate">
+                                    {anyAscii(p.game_name)}
+                                  </span>
+                                  <div className="flex items-center gap-1 min-w-0">
+                                    <span className="text-[10px] text-gray-500 truncate">{p.game_name}</span>
+                                    <button
+                                      type="button"
+                                      title="Copy original name"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        void navigator.clipboard.writeText(p.game_name);
+                                      }}
+                                      className="shrink-0 p-0.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                                      aria-label="Copy original name"
+                                    >
+                                      <svg
+                                        xmlns="http://www.w3.org/2000/svg"
+                                        viewBox="0 0 16 16"
+                                        fill="currentColor"
+                                        className="w-3 h-3"
+                                        aria-hidden
+                                      >
+                                        <path d="M4 2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v1h1a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-1H3a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h1V2zm2-1a1 1 0 0 0-1 1v1h7a1 1 0 0 0 1-1V2H6zM3 5v8h8V5H3zm10 1v7a1 1 0 0 0 1-1V6h-1z" />
+                                      </svg>
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <span className="text-sm font-bold text-gray-900 dark:text-white truncate min-w-0 flex-1">
+                                  {p.game_name}
+                                </span>
+                              )}
                               {hasPriorMatches && (
                                 <span
                                   className="text-[10px] font-semibold tabular-nums text-teal-500/55 uppercase tracking-wide shrink-0"
@@ -676,11 +921,11 @@ export default function App() {
                                 </span>
                               )}
                               {p.tag_line && (
-                                <span className="text-xs text-gray-400 dark:text-gray-500 shrink-0">#{p.tag_line}</span>
+                                <span className="text-xs text-gray-500 dark:text-gray-400 shrink-0">#{p.tag_line}</span>
                               )}
                             </div>
                             <div className="flex items-center gap-2 mt-0.5">
-                              <span className="text-xs text-gray-400 dark:text-gray-500 uppercase tracking-wide">{p.agent_name}</span>
+                              <span className="text-xs text-gray-600 dark:text-gray-400 uppercase tracking-wide">{p.agent_name}</span>
                               {p.account_level != null && p.account_level > 0 && (
                                 <span className="text-xs text-gray-400 dark:text-gray-600">Lvl {p.account_level}</span>
                               )}
@@ -703,13 +948,31 @@ export default function App() {
                           </div>
 
                           {/* Peak rank */}
-                          <div className="flex items-center">
-                            <PeakBadge tier={p.peak_tier} icon={p.peak_rank_icon} />
-                          </div>
+                          {(() => {
+                            const peakSeasonInfo = p.peakSeasonShort
+                              ? getSeasonInfo(p.peakSeasonShort)
+                              : null;
+                            const peakSeasonLine =
+                              peakSeasonInfo != null
+                                ? formatSeasonCompactLine(peakSeasonInfo)
+                                : null;
+                            return (
+                              <div className="flex flex-col items-start gap-0 min-w-0 max-w-full">
+                                <PeakBadge tier={p.peak_tier} icon={p.peak_rank_icon} />
+                                {peakSeasonLine ? (
+                                  <span className="text-[10px] text-gray-500 dark:text-gray-500 whitespace-nowrap truncate max-w-full leading-tight">
+                                    {peakSeasonLine}
+                                  </span>
+                                ) : null}
+                              </div>
+                            );
+                          })()}
 
                           <MatchStatColumns
                             stats={playerStats[p.puuid]}
                             loading={Boolean(playerStatLoading[p.puuid])}
+                            actWins={p.actWins}
+                            actLosses={p.actLosses}
                           />
                         </div>
                       );

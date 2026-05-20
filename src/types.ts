@@ -5,6 +5,8 @@ export interface Settings {
   alwaysOnTop: boolean;
   opacity: number;
   soundEnabled: boolean;
+  /** When true, Tailwind `dark` class is applied on `<html>`. */
+  darkMode?: boolean;
 }
 
 export interface PlayerPresence {
@@ -45,6 +47,10 @@ export interface PregamePlayer {
   rank_icon: string | null;
   peak_tier: number;
   peak_rank_icon: string | null;
+  peakSeasonShort?: string;
+  actWins?: number;
+  actLosses?: number;
+  actGames?: number;
   party_color: string | null;
 }
 
@@ -68,6 +74,10 @@ export type MmrDiskCacheEntry = {
   rr: number;
   peakTier: number;
   peakTierName: string;
+  peakSeasonShort?: string;
+  actWins?: number;
+  actLosses?: number;
+  actGames?: number;
   fetchedAt: number;
 };
 
@@ -91,6 +101,10 @@ export type MmrEntry = {
   peak_tier: number;
   rank_icon: string | null;
   peak_rank_icon: string | null;
+  peakSeasonShort?: string;
+  actWins?: number;
+  actLosses?: number;
+  actGames?: number;
 };
 
 export type FetchPhase =
@@ -99,3 +113,26 @@ export type FetchPhase =
   | "loading_players"
   | "loading_ranks"
   | "done";
+
+export interface PersonalStats {
+  puuid: string;
+  name: string;
+  tag: string;
+  accountLevel: number;
+  currentTier: number;
+  currentTierName: string;
+  rankingInTier: number;
+  peakTier: number;
+  peakTierName: string;
+  peakSeasonShort?: string;
+  actWins: number;
+  actLosses: number;
+  actMatches: number;
+  kda: number;
+  headshotPct: number;
+  sessionWins: number;
+  sessionLosses: number;
+  sessionKda: number;
+  sessionMatches: number;
+  playerCardUrl: string;
+}

@@ -9,6 +9,7 @@ const DEFAULTS: Settings = {
   alwaysOnTop: true,
   opacity: 1,
   soundEnabled: true,
+  darkMode: true,
 };
 
 const STORAGE_KEY = "burgerlens_settings";

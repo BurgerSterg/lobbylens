@@ -486,6 +486,14 @@ mod commands {
             .set_always_on_top(value)
             .map_err(|e| e.to_string())
     }
+
+    #[tauri::command]
+    pub async fn focus_window(app: tauri::AppHandle) -> Result<(), String> {
+        app.get_webview_window("main")
+            .ok_or("Window not found".to_string())?
+            .set_focus()
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -508,7 +516,8 @@ pub fn run() {
             commands::save_match_history,
             commands::load_mmr_cache,
             commands::save_mmr_cache,
-            commands::set_always_on_top
+            commands::set_always_on_top,
+            commands::focus_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

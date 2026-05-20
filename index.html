@@ -1,13 +1,42 @@
 <!doctype html>
-<html lang="en" style="background-color: #0f1117; height: 100%">
+<html lang="en" style="height: 100%">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>BurgerLens</title>
+    <style>
+      ::-webkit-scrollbar { width: 6px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: rgba(156,163,175,0.4); border-radius: 3px; }
+      ::-webkit-scrollbar-thumb:hover { background: rgba(156,163,175,0.7); }
+    </style>
+    <script>
+      (function () {
+        try {
+          var raw = localStorage.getItem("burgerlens_settings");
+          if (raw) {
+            var s = JSON.parse(raw);
+            if (s.darkMode === true) {
+              document.documentElement.classList.add("dark");
+              return;
+            }
+            if (s.darkMode === false) {
+              return;
+            }
+          }
+          var legacy = localStorage.getItem("burgerlens-theme");
+          if (legacy !== "light") {
+            document.documentElement.classList.add("dark");
+          }
+        } catch (e) {
+          document.documentElement.classList.add("dark");
+        }
+      })();
+    </script>
   </head>
 
-  <body style="margin: 0; height: 100%; min-height: 0; overflow: hidden; background-color: #0f1117">
+  <body style="margin: 0; height: 100%; min-height: 0; overflow: hidden">
     <div id="root" style="height: 100%; min-height: 0; width: 100%"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

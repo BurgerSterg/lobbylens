@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
-import type { FetchPhase, MmrEntry, PlayerMatchStats, PlayerPresence, PregamePlayer, Settings } from "../types";
+import { invoke } from "@tauri-apps/api/core";
+import type { FetchPhase, MmrEntry, PersonalStats, PlayerMatchStats, PlayerPresence, PregamePlayer, Settings } from "../types";
 import {
   backfillMatchHistory,
   flushPendingMatchToHistory,
@@ -10,6 +11,7 @@ import {
   cachedMMR,
   fetchHenrikAccountLevel,
   fetchHenrikMmrForPlayer,
+  fetchPersonalStats,
   fetchPlayerRecentStats,
   identityAccountLevelValue,
   initMmrDiskCache,
@@ -239,6 +241,9 @@ export function useLobby(settings: Settings) {
   const [matchState, setMatchState] = useState<"MENUS" | "PREGAME" | "INGAME" | null>(null);
   const [playerStats, setPlayerStats] = useState<Record<string, PlayerMatchStats>>({});
   const [playerStatLoading, setPlayerStatLoading] = useState<Record<string, boolean>>({});
+  const [personalStats, setPersonalStats] = useState<PersonalStats | null>(null);
+  const [personalStatsLoading, setPersonalStatsLoading] = useState(false);
+  const [pregameMatchIdForUi, setPregameMatchIdForUi] = useState<string | null>(null);
 
   const isFetchingRef = useRef(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -253,6 +258,88 @@ export function useLobby(settings: Settings) {
   const statsKickStartedRef = useRef<string | null>(null);
   const consecutiveConnectionFailuresRef = useRef(0);
   const playedLobbyLoadedChimeForMatchRef = useRef<string | null>(null);
+  const hasAutoFocusedForMatchRef = useRef<string | null>(null);
+  const sessionWinsRef = useRef(0);
+  const sessionLossesRef = useRef(0);
+  const sessionMatchesRef = useRef(0);
+  const sessionKdaAccumulatorRef = useRef<number[]>([]);
+  /** Dedupe key for personal Henrik fetch: puuid + region + API key. */
+  const personalStatsFetchedForPuuidRef = useRef("");
+
+  function overlayPersonalSession(base: PersonalStats): PersonalStats {
+    const acc = sessionKdaAccumulatorRef.current;
+    const sessionKda =
+      acc.length > 0 ? acc.reduce((sum, v) => sum + v, 0) / acc.length : 0;
+    return {
+      ...base,
+      sessionWins: sessionWinsRef.current,
+      sessionLosses: sessionLossesRef.current,
+      sessionMatches: sessionMatchesRef.current,
+      sessionKda,
+    };
+  }
+
+  async function refreshPersonalStats() {
+    if (!localPuuid.trim() || !settings.henrikApiKey.trim()) return;
+    setPersonalStatsLoading(true);
+    try {
+      const s = await fetchPersonalStats(
+        localPuuid,
+        "",
+        "",
+        settings.region,
+        settings.henrikApiKey,
+        { bypassCache: true },
+      );
+      setPersonalStats(s ? overlayPersonalSession(s) : null);
+    } finally {
+      setPersonalStatsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    sessionWinsRef.current = 0;
+    sessionLossesRef.current = 0;
+    sessionMatchesRef.current = 0;
+    sessionKdaAccumulatorRef.current = [];
+    personalStatsFetchedForPuuidRef.current = "";
+    setPersonalStats(null);
+  }, [localPuuid]);
+
+  useEffect(() => {
+    if (!localPuuid.trim()) {
+      setPersonalStats(null);
+      setPersonalStatsLoading(false);
+      return;
+    }
+    if (!settings.henrikApiKey.trim()) {
+      setPersonalStatsLoading(false);
+      return;
+    }
+    const dedupeKey = `${localPuuid}|${settings.region}|${settings.henrikApiKey.trim()}`;
+    if (personalStatsFetchedForPuuidRef.current === dedupeKey) return;
+    setPersonalStatsLoading(true);
+    void fetchPersonalStats(localPuuid, "", "", settings.region, settings.henrikApiKey)
+      .then((s) => {
+        setPersonalStats(s ? overlayPersonalSession(s) : null);
+      })
+      .finally(() => {
+        personalStatsFetchedForPuuidRef.current = dedupeKey;
+        setPersonalStatsLoading(false);
+      });
+  }, [localPuuid, settings.henrikApiKey, settings.region]);
+
+  useEffect(() => {
+    if (matchState === "MENUS") {
+      hasAutoFocusedForMatchRef.current = null;
+      return;
+    }
+    if (matchState !== "PREGAME") return;
+    const mid = pregameMatchIdForUi;
+    if (!mid || hasAutoFocusedForMatchRef.current === mid) return;
+    hasAutoFocusedForMatchRef.current = mid;
+    void invoke("focus_window").catch(() => {});
+  }, [matchState, pregameMatchIdForUi]);
 
   useEffect(() => {
     startDetecting();
@@ -305,6 +392,7 @@ export function useLobby(settings: Settings) {
     for (const k of Object.keys(knownPartyMembers)) delete knownPartyMembers[k];
     statsMatchIdRef.current = null;
     statsKickStartedRef.current = null;
+    setPregameMatchIdForUi(null);
     setPlayerStats({});
     setPlayerStatLoading({});
     resetHenrikLobbyCaches();
@@ -321,7 +409,14 @@ export function useLobby(settings: Settings) {
     }
     const pending = pendingMatchRef.current;
     pendingMatchRef.current = null;
-    await flushPendingMatchToHistory(pending, myPuuid, settings.region, settings.henrikApiKey);
+    const outcome = await flushPendingMatchToHistory(pending, myPuuid, settings.region, settings.henrikApiKey);
+    if (outcome.appended && outcome.kda != null && outcome.won != null) {
+      sessionMatchesRef.current += 1;
+      if (outcome.won) sessionWinsRef.current += 1;
+      else sessionLossesRef.current += 1;
+      sessionKdaAccumulatorRef.current.push(outcome.kda);
+      setPersonalStats((prev) => (prev ? overlayPersonalSession(prev) : null));
+    }
   }
 
   async function detectMatchState() {
@@ -484,6 +579,7 @@ export function useLobby(settings: Settings) {
 
       try {
         const matchId = await getPregameMatchIdExternal(puuid, tokens, region);
+        setPregameMatchIdForUi(matchId);
         if (statsMatchIdRef.current !== matchId) {
           statsMatchIdRef.current = matchId;
           statsKickStartedRef.current = null;
@@ -590,6 +686,10 @@ export function useLobby(settings: Settings) {
                       peak_tier: entry.peak_tier,
                       rank_icon: entry.rank_icon,
                       peak_rank_icon: entry.peak_rank_icon,
+                      peakSeasonShort: entry.peakSeasonShort,
+                      actWins: entry.actWins,
+                      actLosses: entry.actLosses,
+                      actGames: entry.actGames,
                     }
                   : player,
               ),
@@ -617,6 +717,10 @@ export function useLobby(settings: Settings) {
                         peak_tier: entry.peak_tier,
                         rank_icon: entry.rank_icon,
                         peak_rank_icon: entry.peak_rank_icon,
+                        peakSeasonShort: entry.peakSeasonShort,
+                        actWins: entry.actWins,
+                        actLosses: entry.actLosses,
+                        actGames: entry.actGames,
                       }
                     : player,
                 ),
@@ -635,6 +739,10 @@ export function useLobby(settings: Settings) {
           rank_icon: mmrMap[row.puuid]?.rank_icon ?? null,
           peak_tier: mmrMap[row.puuid]?.peak_tier ?? 0,
           peak_rank_icon: mmrMap[row.puuid]?.peak_rank_icon ?? null,
+          peakSeasonShort: mmrMap[row.puuid]?.peakSeasonShort,
+          actWins: mmrMap[row.puuid]?.actWins,
+          actLosses: mmrMap[row.puuid]?.actLosses,
+          actGames: mmrMap[row.puuid]?.actGames,
         }));
 
         setPregamePlayers(applyPartyColorsToMerged(merged));
@@ -661,6 +769,7 @@ export function useLobby(settings: Settings) {
             setPlayerStats({});
             setPlayerStatLoading({});
           }
+          setPregameMatchIdForUi(null);
           let match;
           try {
             match = await getCoregameMatchExternal(matchId, tokens, region);
@@ -747,6 +856,10 @@ export function useLobby(settings: Settings) {
                         peak_tier: entry.peak_tier,
                         rank_icon: entry.rank_icon,
                         peak_rank_icon: entry.peak_rank_icon,
+                        peakSeasonShort: entry.peakSeasonShort,
+                        actWins: entry.actWins,
+                        actLosses: entry.actLosses,
+                        actGames: entry.actGames,
                       }
                     : player,
                 ),
@@ -774,6 +887,10 @@ export function useLobby(settings: Settings) {
                           peak_tier: entry.peak_tier,
                           rank_icon: entry.rank_icon,
                           peak_rank_icon: entry.peak_rank_icon,
+                          peakSeasonShort: entry.peakSeasonShort,
+                          actWins: entry.actWins,
+                          actLosses: entry.actLosses,
+                          actGames: entry.actGames,
                         }
                       : player,
                   ),
@@ -792,6 +909,10 @@ export function useLobby(settings: Settings) {
             rank_icon: mmrMap[row.puuid]?.rank_icon ?? null,
             peak_tier: mmrMap[row.puuid]?.peak_tier ?? 0,
             peak_rank_icon: mmrMap[row.puuid]?.peak_rank_icon ?? null,
+            peakSeasonShort: mmrMap[row.puuid]?.peakSeasonShort,
+            actWins: mmrMap[row.puuid]?.actWins,
+            actLosses: mmrMap[row.puuid]?.actLosses,
+            actGames: mmrMap[row.puuid]?.actGames,
           }));
 
           kickoffPlayerStatsIfNeeded(
@@ -848,6 +969,7 @@ export function useLobby(settings: Settings) {
         for (const k of Object.keys(knownPartyMembers)) delete knownPartyMembers[k];
         statsMatchIdRef.current = null;
         statsKickStartedRef.current = null;
+        setPregameMatchIdForUi(null);
         setPlayerStats({});
         setPlayerStatLoading({});
         resetHenrikLobbyCaches();
@@ -872,6 +994,7 @@ export function useLobby(settings: Settings) {
         for (const k of Object.keys(knownPartyMembers)) delete knownPartyMembers[k];
         statsMatchIdRef.current = null;
         statsKickStartedRef.current = null;
+        setPregameMatchIdForUi(null);
         setPlayerStats({});
         setPlayerStatLoading({});
         resetHenrikLobbyCaches();
@@ -890,6 +1013,9 @@ export function useLobby(settings: Settings) {
     pregamePlayers,
     playerStats,
     playerStatLoading,
+    personalStats,
+    personalStatsLoading,
+    refreshPersonalStats,
     mapName,
     serverName,
     localPuuid,
