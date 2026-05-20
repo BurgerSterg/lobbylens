@@ -16,6 +16,13 @@ jobs:
         with:
           node-version: 20
 
+      - name: Set version from tag
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          (Get-Content package.json) -replace '"version": "[^"]*"', "`"version`": `"$tag`"" | Set-Content package.json
+          (Get-Content src-tauri/tauri.conf.json) -replace '"version": "[^"]*"', "`"version`": `"$tag`"" | Set-Content src-tauri/tauri.conf.json
+        shell: pwsh
+
       - name: Install dependencies
         run: npm install
 
