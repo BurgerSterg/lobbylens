@@ -182,34 +182,44 @@ function average(nums: number[]): number {
   return nums.reduce((a, b) => a + b, 0) / nums.length;
 }
 
-function teamComposite(team: PlayerRow[], statsByPuuid: Record<string, PlayerMatchStats>): number {
-  const kdaNorms = team
-    .map((p) => statsByPuuid[p.puuid]?.kda)
-    .filter((x): x is number => x != null && Number.isFinite(x))
-    .map((kda) => Math.min(Math.max(kda / 2.5, 0), 1));
-
+function teamComposite(team: PlayerRow[]): number {
+  // Win rate from act record (MMR data -- available for all ranked players)
   const winRates = team
-    .map((p) => statsByPuuid[p.puuid]?.winRate)
-    .filter((x): x is number => x != null && Number.isFinite(x));
+    .map((p) => {
+      const total = (p.actWins ?? 0) + (p.actLosses ?? 0);
+      if (total < 3) return null; // ignore players with too few games
+      return (p.actWins ?? 0) / total;
+    })
+    .filter((x): x is number => x !== null && Number.isFinite(x));
 
+  // Games played this act -- more games = more reliable data, slight bonus
+  const gamesNorms = team
+    .map((p) => {
+      const g = p.actGames ?? 0;
+      return Math.min(g / 60, 1); // normalize: 60+ games = max
+    });
+
+  // Current rank normalized
   const ranks = team.map((p) => tierToNorm(p.competitive_tier));
+
+  // Peak rank normalized
   const peaks = team.map((p) => tierToNorm(p.peak_tier));
 
+  // 40% current rank, 30% act win rate, 20% peak rank, 10% games played
   return (
-    0.35 * average(kdaNorms) +
-    0.3 * average(winRates) +
-    0.25 * average(ranks) +
-    0.1 * average(peaks)
+    0.40 * average(ranks) +
+    0.30 * average(winRates.length > 0 ? winRates : ranks.map(() => 0.5)) +
+    0.20 * average(peaks) +
+    0.10 * average(gamesNorms)
   );
 }
 
 export function calculateWinProbability(
   players: PlayerRow[],
-  playerStats: Record<string, PlayerMatchStats>,
 ): { blueWinPct: number; redWinPct: number; confidence: "low" | "medium" | "high" } {
   const { blue, red } = partitionBlueRed(players);
-  const blueScore = teamComposite(blue, playerStats);
-  const redScore = teamComposite(red, playerStats);
+  const blueScore = teamComposite(blue);
+  const redScore = teamComposite(red);
   const sum = blueScore + redScore;
   let blueWinPct = sum > 0 ? (blueScore / sum) * 100 : 50;
   let redWinPct = sum > 0 ? (redScore / sum) * 100 : 50;
@@ -219,10 +229,13 @@ export function calculateWinProbability(
     redWinPct = (redWinPct / totalPct) * 100;
   }
 
-  const withStats = players.filter((p) => playerStats[p.puuid] != null).length;
+  const withActData = players.filter(
+    (p) => (p.actWins !== undefined || p.actLosses !== undefined) &&
+           (p.competitive_tier ?? 0) > 0,
+  ).length;
   let confidence: "low" | "medium" | "high";
-  if (withStats < 6) confidence = "low";
-  else if (withStats <= 8) confidence = "medium";
+  if (withActData < 6) confidence = "low";
+  else if (withActData <= 8) confidence = "medium";
   else confidence = "high";
 
   return { blueWinPct, redWinPct, confidence };

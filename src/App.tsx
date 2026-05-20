@@ -1,4 +1,4 @@
-import { useState, useEffect, type ReactNode } from "react";
+import { useState, useEffect } from "react";
 import anyAscii from "any-ascii";
 import { useLobby, calculateWinProbability } from "./hooks/useLobby";
 import type {
@@ -6,7 +6,6 @@ import type {
   MatchRecord,
   PersonalStats,
   PlayerPresence,
-  PlayerMatchStats,
   PregamePlayer,
   Settings,
 } from "./types";
@@ -445,123 +444,92 @@ function PersonalCard({
   );
 }
 
-// KDA and WIN% removed -- WinProbabilityFooter still uses playerStats internally
+// Columns: icon · Player · Rank · Peak · W/L% · GAMES
 const MATCH_TABLE_GRID =
-  "40px minmax(88px,2fr) minmax(52px,1fr) minmax(48px,1fr) minmax(2.75rem,0.85fr) minmax(2.75rem,0.85fr) minmax(2.5rem,0.75fr)";
+  "40px minmax(88px,2fr) minmax(52px,1fr) minmax(48px,1fr) minmax(3.5rem,1fr) minmax(3rem,0.85fr)";
 
-function headshotPctTextClass(pct: number): string {
-  if (pct < 15) return "text-red-500 dark:text-red-400";
-  if (pct <= 22) return "text-yellow-600 dark:text-yellow-500";
-  return "text-green-600 dark:text-green-400";
-}
 
 function MatchStatColumns({
-  stats,
   loading,
   actWins,
   actLosses,
+  actGames,
 }: {
-  stats: PlayerMatchStats | undefined;
   loading: boolean;
   actWins?: number;
   actLosses?: number;
+  actGames?: number;
 }) {
-  const hsEl =
-    loading ? (
-      <span className="animate-pulse text-gray-400 dark:text-gray-500">...</span>
-    ) : stats ? (
-      <span className={headshotPctTextClass(stats.headshotPct)}>{stats.headshotPct.toFixed(1)}%</span>
-    ) : (
-      <span className="text-gray-400 dark:text-gray-600">—</span>
-    );
-
   const wlEl =
     actWins !== undefined && actLosses !== undefined ? (() => {
       const total = actWins + actLosses;
-      const pct = total > 0 ? Math.round((actWins / total) * 100) : null;
+      if (total === 0) return <span className="text-gray-600 dark:text-gray-600 text-xs">0 games</span>;
+      const pct = Math.round((actWins / total) * 100);
       const pctClass =
-        pct == null ? ""
-          : pct >= 55 ? "text-green-400 dark:text-green-400"
-          : pct <= 45 ? "text-red-400 dark:text-red-400"
-          : "text-gray-400 dark:text-gray-500";
+        pct >= 55 ? "text-green-400"
+          : pct <= 45 ? "text-red-400"
+          : "text-gray-300 dark:text-gray-300";
       return (
         <div className="flex flex-col items-end gap-0.5">
-          <span className="flex gap-1 text-xs">
-            <span className="text-green-500 dark:text-green-400 font-medium">{actWins}W</span>
-            <span className="text-gray-500 dark:text-gray-600">/</span>
-            <span className="text-red-500 dark:text-red-400 font-medium">{actLosses}L</span>
-          </span>
-          {pct != null && (
-            <span className={`text-[10px] font-medium ${pctClass}`}>{pct}%</span>
-          )}
+          <span className={`text-sm font-bold tabular-nums ${pctClass}`}>{pct}%</span>
+          <span className="text-[10px] text-gray-500 dark:text-gray-500 tabular-nums">{actWins}W / {actLosses}L</span>
         </div>
       );
-    })() : (
-      <span className="text-gray-400 dark:text-gray-600">—</span>
+    })() : loading ? (
+      <span className="animate-pulse text-gray-500 dark:text-gray-500 text-xs">...</span>
+    ) : (
+      <span className="text-gray-600 dark:text-gray-600">—</span>
+    );
+
+  const gamesEl =
+    actGames !== undefined && actGames > 0 ? (
+      <div className="flex flex-col items-end gap-0.5">
+        <span className="text-sm font-medium text-gray-300 dark:text-gray-300 tabular-nums">{actGames}</span>
+        <span className="text-[10px] text-gray-500 dark:text-gray-500">this act</span>
+      </div>
+    ) : loading ? (
+      <span className="animate-pulse text-gray-500 dark:text-gray-500 text-xs">...</span>
+    ) : (
+      <span className="text-gray-600 dark:text-gray-600">—</span>
     );
 
   return (
     <>
-      <div className="text-xs tabular-nums text-right text-gray-700 dark:text-gray-300">
-        {loading ? (
-          <span className="animate-pulse text-gray-400 dark:text-gray-500">...</span>
-        ) : stats ? (
-          <span>{Math.round(stats.avgACS)}</span>
-        ) : (
-          <span className="text-gray-400 dark:text-gray-600">—</span>
-        )}
-      </div>
-      <div className="text-xs tabular-nums text-right">{hsEl}</div>
-      <div className="text-[10px] tabular-nums text-right leading-tight">{wlEl}</div>
+      <div className="tabular-nums text-right">{wlEl}</div>
+      <div className="tabular-nums text-right">{gamesEl}</div>
     </>
   );
 }
 
 function WinProbabilityFooter({
   roster,
-  playerStats,
-  playerStatLoading,
   henrikConfigured,
 }: {
   roster: PregamePlayer[];
-  playerStats: Record<string, PlayerMatchStats>;
-  playerStatLoading: Record<string, boolean>;
   henrikConfigured: boolean;
 }) {
-  if (!henrikConfigured || roster.length === 0) return null;
+  if (!henrikConfigured || roster.length < 2) return null;
 
-  const loadedCount = roster.filter((p) => playerStats[p.puuid] != null).length;
-  const anyLoading = roster.some((p) => playerStatLoading[p.puuid]);
-  const showCalculating = loadedCount === 0 && anyLoading;
+  const rankedCount = roster.filter((p) => (p.competitive_tier ?? 0) > 0).length;
+  if (rankedCount < 2) return null;
 
-  let barEl: ReactNode = null;
-  if (loadedCount >= 4) {
-    const { blueWinPct, redWinPct, confidence } = calculateWinProbability(roster, playerStats);
-    const confLabel =
-      confidence === "low" ? "Low confidence"
-        : confidence === "medium" ? "Medium confidence"
-        : "High confidence";
-    barEl = (
-      <div className="mt-1">
-        <div className="flex h-3 w-full overflow-hidden rounded bg-gray-200 dark:bg-gray-800">
-          <div className="bg-blue-600 transition-[width] duration-700 ease-out" style={{ width: `${blueWinPct}%` }} />
-          <div className="bg-red-600 transition-[width] duration-700 ease-out" style={{ width: `${redWinPct}%` }} />
-        </div>
-        <div className="flex justify-between items-start gap-2 mt-1.5 text-xs">
-          <span className="text-blue-600 dark:text-blue-400 tabular-nums font-semibold">{blueWinPct.toFixed(1)}%</span>
-          <span className="text-[10px] text-gray-600 dark:text-gray-500 text-center flex-1">{confLabel}</span>
-          <span className="text-red-600 dark:text-red-400 tabular-nums font-semibold">{redWinPct.toFixed(1)}%</span>
-        </div>
-      </div>
-    );
-  }
+  const { blueWinPct, redWinPct, confidence } = calculateWinProbability(roster);
+  const confLabel =
+    confidence === "low" ? "Low confidence"
+      : confidence === "medium" ? "Medium confidence"
+      : "High confidence";
 
   return (
     <div className="border-t border-gray-200 dark:border-gray-800 bg-gray-100/95 dark:bg-gray-950/90 px-4 py-3">
-      {showCalculating && (
-        <div className="text-xs text-gray-600 dark:text-gray-500 animate-pulse mb-2">Calculating...</div>
-      )}
-      {barEl}
+      <div className="flex h-3 w-full overflow-hidden rounded bg-gray-200 dark:bg-gray-800">
+        <div className="bg-blue-600 transition-[width] duration-700 ease-out" style={{ width: `${blueWinPct}%` }} />
+        <div className="bg-red-600 transition-[width] duration-700 ease-out" style={{ width: `${redWinPct}%` }} />
+      </div>
+      <div className="flex justify-between items-start gap-2 mt-1.5 text-xs">
+        <span className="text-blue-600 dark:text-blue-400 tabular-nums font-semibold">{blueWinPct.toFixed(1)}%</span>
+        <span className="text-[10px] text-gray-600 dark:text-gray-500 text-center flex-1">{confLabel}</span>
+        <span className="text-red-600 dark:text-red-400 tabular-nums font-semibold">{redWinPct.toFixed(1)}%</span>
+      </div>
     </div>
   );
 }
@@ -577,7 +545,6 @@ export default function App() {
   const {
     players,
     pregamePlayers,
-    playerStats,
     playerStatLoading,
     mapName,
     serverName,
@@ -765,9 +732,8 @@ export default function App() {
                 <div>Player</div>
                 <div>Rank</div>
                 <div>Peak</div>
-                <div className="text-right">ACS</div>
-                <div className="text-right">HS%</div>
-                <div className="text-right">W/L</div>
+                <div className="text-right">W/L%</div>
+                <div className="text-right">Games</div>
               </div>
 
               {["Blue", "Red", "ally", "enemy", ""].map((team) => {
@@ -969,10 +935,10 @@ export default function App() {
                           })()}
 
                           <MatchStatColumns
-                            stats={playerStats[p.puuid]}
                             loading={Boolean(playerStatLoading[p.puuid])}
                             actWins={p.actWins}
                             actLosses={p.actLosses}
+                            actGames={p.actGames}
                           />
                         </div>
                       );
@@ -983,8 +949,6 @@ export default function App() {
 
               <WinProbabilityFooter
                 roster={pregamePlayers}
-                playerStats={playerStats}
-                playerStatLoading={playerStatLoading}
                 henrikConfigured={Boolean(settings.henrikApiKey.trim())}
               />
             </div>
