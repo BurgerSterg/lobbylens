@@ -889,6 +889,18 @@ export default function App() {
                               {p.tag_line && (
                                 <span className="text-xs text-gray-500 dark:text-gray-400 shrink-0">#{p.tag_line}</span>
                               )}
+                              {p.party_color && (p.party_size ?? 0) > 1 && (
+                                <span
+                                  className="text-[9px] font-bold px-1 py-0.5 rounded ml-1 shrink-0"
+                                  style={{
+                                    backgroundColor: p.party_color + "30",
+                                    color: p.party_color,
+                                    border: `1px solid ${p.party_color}60`,
+                                  }}
+                                >
+                                  {p.party_size}
+                                </span>
+                              )}
                             </div>
                             <div className="flex items-center gap-2 mt-0.5">
                               <span className="text-xs text-gray-600 dark:text-gray-400 uppercase tracking-wide">{p.agent_name}</span>

@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { FetchPhase, MmrEntry, PersonalStats, PlayerMatchStats, PlayerPresence, PregamePlayer, Settings } from "../types";
+import { fetchRiotMmrForPlayer, type LocalMmrResult } from "../api/riotMmr";
 import {
   backfillMatchHistory,
   flushPendingMatchToHistory,
@@ -9,15 +11,11 @@ import {
 } from "./useMatchHistory";
 import {
   cachedMMR,
-  fetchHenrikAccountLevel,
   fetchHenrikMmrForPlayer,
   fetchPersonalStats,
-  fetchPlayerRecentStats,
-  identityAccountLevelValue,
   initMmrDiskCache,
   mergeIncognitoNamesFromHenrik,
   resetHenrikLobbyCaches,
-  resolvedAccountLevels,
 } from "../api/henrik";
 import { playLobbyLoadedChime } from "../utils/sound";
 import {
@@ -25,7 +23,6 @@ import {
   getCoregameMatchExternal,
   getCoregameMatchIdExternal,
   getLocalPlayer,
-  getPartyMembers,
   getPlayerNames,
   getPregameMatchExternal,
   getPregameMatchIdExternal,
@@ -114,18 +111,52 @@ async function fetchRankMap(): Promise<Record<number, string>> {
 
 export type { PlayerPresence, PregamePlayer } from "../types";
 
-/** Merged from every presences poll — Riot adds more players over time; partyId enables stranger party detection. */
-let accumulatedPartyIdsByPuuid: Record<string, string> = {};
+/**
+ * Build a { puuid -> partyId } map from a presence snapshot, scoped to the given lobby PUUIDs.
+ * Works for enemies too -- Riot broadcasts partyId for all Valorant players in the presence list.
+ */
+async function waitForAllPresences(
+  lobbyPuuids: string[],
+  timeoutMs = 15000,
+  intervalMs = 1500,
+): Promise<PlayerPresence[]> {
+  const deadline = Date.now() + timeoutMs;
+  const puuidSet = new Set(lobbyPuuids.map((p) => p.toLowerCase()));
+  let best: PlayerPresence[] = [];
 
-/** partyId -> member PUUIDs from get_party_members (full roster per party). */
-const knownPartyMembers: Record<string, string[]> = {};
-
-function mergePartyIdsFromPresences(
-  presences: ReadonlyArray<{ puuid: string; party_id: string | null }>,
-) {
-  for (const p of presences) {
-    if (p.party_id) accumulatedPartyIdsByPuuid[p.puuid] = p.party_id;
+  while (Date.now() < deadline) {
+    const presences = await invoke<PlayerPresence[]>("get_presences");
+    const found = presences.filter((p) => p.puuid && puuidSet.has(p.puuid.toLowerCase()));
+    if (found.length > best.length) best = presences;
+    if (found.length >= lobbyPuuids.length) return presences;
+    await new Promise<void>((r) => setTimeout(r, intervalMs));
   }
+
+  return best;
+}
+
+function buildPartyMapFromPresence(
+  presences: ReadonlyArray<{ puuid: string; party_id: string | null }>,
+  lobbyPuuids: string[],
+  wsPartyMap: Record<string, string>,
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  const puuidSet = new Set(lobbyPuuids.map((p) => p.toLowerCase()));
+
+  // REST presence data (party_id already decoded by Rust)
+  for (const p of presences) {
+    if (!p.puuid || !p.party_id) continue;
+    if (!puuidSet.has(p.puuid.toLowerCase())) continue;
+    result[p.puuid] = p.party_id;
+  }
+
+  // Websocket accumulated data overwrites REST — more complete, includes enemies
+  for (const puuid of lobbyPuuids) {
+    const lower = puuid.toLowerCase();
+    if (wsPartyMap[lower]) result[lower] = wsPartyMap[lower];
+  }
+
+  return result;
 }
 
 /** Riot/local invoke failed on the wire — retry next poll; not logical "not in match" outcomes. */
@@ -270,6 +301,9 @@ export function useLobby(settings: Settings) {
   const statsMatchIdRef = useRef<string | null>(null);
   const statsKickStartedRef = useRef<string | null>(null);
   const consecutiveConnectionFailuresRef = useRef(0);
+  const clientVersionRef = useRef("release-09.00-shipping-9-2459107");
+  const localMmrCacheRef = useRef<{ matchId: string; data: Record<string, LocalMmrResult> } | null>(null);
+  const websocketPartyMapRef = useRef<Record<string, string>>({});
   const playedLobbyLoadedChimeForMatchRef = useRef<string | null>(null);
   const hasAutoFocusedForMatchRef = useRef<string | null>(null);
   const sessionWinsRef = useRef(0);
@@ -354,10 +388,57 @@ export function useLobby(settings: Settings) {
     void invoke("focus_window").catch(() => {});
   }, [matchState, pregameMatchIdForUi]);
 
+  // Immediately fetch lobby data when a match is detected instead of waiting for next interval tick
+  useEffect(() => {
+    if (matchState === "PREGAME" || matchState === "INGAME") {
+      fetchLobby();
+    }
+  }, [matchState]);
+
   useEffect(() => {
     startDetecting();
     void initMmrDiskCache();
+    void invoke<string>("get_client_version")
+      .then((v) => {
+        if (v && v.startsWith("release-")) {
+          clientVersionRef.current = v;
+        } else {
+          return invoke<string>("get_client_version_api");
+        }
+      })
+      .then((v) => {
+        if (v && v.startsWith("release-")) clientVersionRef.current = v;
+      })
+      .catch(() => {});
+
+    invoke("start_presence_websocket").catch(() => {});
+
+    const unlistenPromise = listen("presence-event", (event) => {
+      const payload = event.payload as Record<string, unknown> | null;
+      const presencesRaw =
+        Array.isArray((payload?.data as { presences?: unknown })?.presences)
+          ? ((payload?.data as { presences?: unknown }).presences as unknown[])
+          : Array.isArray(payload?.data)
+            ? (payload.data as unknown[])
+            : null;
+      if (!presencesRaw) return;
+      for (const p of presencesRaw) {
+        const pObj = p as { puuid?: string; private?: string };
+        if (!pObj.puuid || !pObj.private) continue;
+        try {
+          const decoded = JSON.parse(atob(pObj.private)) as Record<string, unknown>;
+          const partyId = (decoded.partyId ?? decoded.PartyId) as string | undefined;
+          if (partyId) {
+            websocketPartyMapRef.current[pObj.puuid.toLowerCase()] = partyId;
+          }
+        } catch {
+          // malformed private blob — skip
+        }
+      }
+    });
+
     return () => {
+      unlistenPromise.then((f) => f());
       stopPolling();
       stopDetecting();
     };
@@ -401,8 +482,6 @@ export function useLobby(settings: Settings) {
     setPregamePlayers([]);
     setMapName("");
     setServerName("");
-    accumulatedPartyIdsByPuuid = {};
-    for (const k of Object.keys(knownPartyMembers)) delete knownPartyMembers[k];
     statsMatchIdRef.current = null;
     statsKickStartedRef.current = null;
     setPregameMatchIdForUi(null);
@@ -511,83 +590,65 @@ export function useLobby(settings: Settings) {
 
       const tokens = await getAuthTokens();
 
-      const kickoffPlayerStatsIfNeeded = (mid: string, rosterPuuids: string[]) => {
-        if (!settings.henrikApiKey.trim()) return;
-        if (statsKickStartedRef.current === mid) return;
-        statsKickStartedRef.current = mid;
-        setPlayerStatLoading(Object.fromEntries(rosterPuuids.map((id) => [id, true])));
-        void Promise.allSettled(
-          rosterPuuids.map(async (id) => {
-            try {
-              const result = await fetchPlayerRecentStats(id, region, settings.henrikApiKey);
-              if (result) setPlayerStats((prev) => ({ ...prev, [id]: result }));
-            } finally {
-              setPlayerStatLoading((prev) => ({ ...prev, [id]: false }));
-            }
-          }),
-        );
+      // Stats (match history) fetches disabled -- 404s for almost all players and
+      // wastes rate limit budget that MMR needs. W/L data now comes from MMR directly.
+      const kickoffPlayerStatsIfNeeded = (_mid: string, _rosterPuuids: string[]) => {
+        // no-op
       };
 
       result = await getPresences();
-      mergePartyIdsFromPresences(result);
       resetValorantTransportStreak();
       setFetchPhase("loading_players");
 
-      const newPartyIds = [
-        ...new Set(
-          result
-            .map((p: any) => p.party_id as string | null)
-            .filter((id): id is string => id != null && id !== "" && !knownPartyMembers[id]),
-        ),
-      ];
+      const PARTY_COLORS_EXPLICIT = ["#f59e0b", "#8b5cf6", "#06b6d4", "#10b981", "#f43f5e"];
 
-      for (const pid of newPartyIds) {
-        try {
-          const partyData = await getPartyMembers(pid, tokens, region);
-          knownPartyMembers[pid] = (partyData.Members ?? []).map((m: any) => m.Subject);
-        } catch {}
-      }
-
-      let myPartyPuuids: string[] = [];
-      try {
-        const myPresence = result.find((p: any) => p.puuid === puuid);
-        if (myPresence?.party_id) {
-          const partyData = await getPartyMembers(myPresence.party_id, tokens, region);
-          myPartyPuuids = (partyData.Members ?? []).map((m: any) => m.Subject);
-        }
-      } catch {}
-
-      const applyPartyColorsToMerged = (merged: PregamePlayer[]): PregamePlayer[] => {
-        const partyColors = ["#60a5fa", "#34d399", "#fbbf24", "#a78bfa", "#f87171"];
-        const seenParties: string[] = [];
-        const matchPuuids = new Set(merged.map((r) => r.puuid));
-
-        return merged.map((p) => {
-          if (myPartyPuuids.includes(p.puuid) && myPartyPuuids.length > 1) {
-            return { ...p, party_color: "#ef4444" };
+      const applyPartyColorsToMerged = (merged: PregamePlayer[], directPartyMap?: Record<string, string>): PregamePlayer[] => {
+        // Priority 1: presence-based party map -- real data for all visible lobby players
+        if (directPartyMap && Object.keys(directPartyMap).length > 0) {
+          const partyGroups: Record<string, string[]> = {};
+          for (const [playerPuuid, partyId] of Object.entries(directPartyMap)) {
+            if (!partyGroups[partyId]) partyGroups[partyId] = [];
+            partyGroups[partyId].push(playerPuuid);
           }
-
-          for (const [partyId, members] of Object.entries(knownPartyMembers)) {
-            if (!members.includes(p.puuid)) continue;
-            const inMatch = members.filter((uuid) => matchPuuids.has(uuid));
-            if (inMatch.length < 2) continue;
-            if (!seenParties.includes(partyId)) seenParties.push(partyId);
-            return {
-              ...p,
-              party_color: partyColors[seenParties.indexOf(partyId) % partyColors.length],
-            };
-          }
-
-          const pid = accumulatedPartyIdsByPuuid[p.puuid];
-          if (!pid) return { ...p, party_color: null };
-          const othersWithSameParty = Object.values(accumulatedPartyIdsByPuuid).filter((v) => v === pid);
-          if (othersWithSameParty.length < 2) return { ...p, party_color: null };
-          if (!seenParties.includes(pid)) seenParties.push(pid);
-          return {
+          const multiParties = Object.entries(partyGroups).filter(([, members]) => members.length >= 2);
+          const colorByPartyId: Record<string, string> = {};
+          const sizeByPuuid: Record<string, number> = {};
+          multiParties.forEach(([partyId, members], idx) => {
+            colorByPartyId[partyId] = PARTY_COLORS_EXPLICIT[idx % PARTY_COLORS_EXPLICIT.length]!;
+            members.forEach((uuid) => { sizeByPuuid[uuid] = members.length; });
+          });
+          return merged.map((p) => ({
             ...p,
-            party_color: partyColors[seenParties.indexOf(pid) % partyColors.length],
-          };
-        });
+            party_color: directPartyMap[p.puuid] ? (colorByPartyId[directPartyMap[p.puuid]!] ?? null) : null,
+            party_size: sizeByPuuid[p.puuid],
+          }));
+        }
+
+        // Priority 2: party_id already set on player objects from game payload
+        const hasPayloadPartyIds = merged.some((p) => p.party_id != null && p.party_id !== "");
+        if (hasPayloadPartyIds) {
+          const partyGroups: Record<string, string[]> = {};
+          for (const p of merged) {
+            if (!p.party_id) continue;
+            if (!partyGroups[p.party_id]) partyGroups[p.party_id] = [];
+            partyGroups[p.party_id].push(p.puuid);
+          }
+          const multiParties = Object.entries(partyGroups).filter(([, members]) => members.length >= 2);
+          const colorByPartyId: Record<string, string> = {};
+          const sizeByPuuid: Record<string, number> = {};
+          multiParties.forEach(([partyId, members], idx) => {
+            colorByPartyId[partyId] = PARTY_COLORS_EXPLICIT[idx % PARTY_COLORS_EXPLICIT.length]!;
+            members.forEach((uuid) => { sizeByPuuid[uuid] = members.length; });
+          });
+          return merged.map((p) => ({
+            ...p,
+            party_color: p.party_id ? (colorByPartyId[p.party_id] ?? null) : null,
+            party_size: sizeByPuuid[p.puuid],
+          }));
+        }
+
+        // No party data -- strip decorations
+        return merged.map((p) => ({ ...p, party_color: null, party_size: undefined }));
       };
 
       try {
@@ -651,6 +712,7 @@ export function useLobby(settings: Settings) {
             peak_tier: 0,
             rank_icon: null,
             peak_rank_icon: null,
+            party_id: p.PartyID ?? undefined,
             party_color: null,
           };
         });
@@ -671,13 +733,49 @@ export function useLobby(settings: Settings) {
             peak_tier: 0,
             rank_icon: null,
             peak_rank_icon: null,
+            party_id: p.PartyID ?? undefined,
             party_color: null,
           };
         });
 
         const allMapped = [...mapped, ...enemyMapped];
 
-        setPregamePlayers(applyPartyColorsToMerged(allMapped));
+        const partyPresencesPre = await waitForAllPresences(allMapped.map((p) => p.puuid));
+        setPregamePlayers(applyPartyColorsToMerged(allMapped, buildPartyMapFromPresence(partyPresencesPre, allMapped.map((p) => p.puuid), websocketPartyMapRef.current)));
+
+        // Phase 1: Local (Riot PD) MMR -- skip if already cached for this match
+        let localMmrByPuuidPre: Record<string, LocalMmrResult> = {};
+        if (localMmrCacheRef.current?.matchId === matchId) {
+          localMmrByPuuidPre = localMmrCacheRef.current.data;
+        } else {
+          const localMmrResultsPre = await Promise.all(
+            allMapped.map((p) =>
+              fetchRiotMmrForPlayer(p.puuid, tokens.accessToken, tokens.token, region, clientVersionRef.current)
+                .then((result) => ({ puuid: p.puuid, result })),
+            ),
+          );
+          for (const { puuid: lp, result } of localMmrResultsPre) {
+            if (result) localMmrByPuuidPre[lp] = result;
+          }
+          localMmrCacheRef.current = { matchId, data: localMmrByPuuidPre };
+        }
+
+        // Apply local rank data immediately (no waiting for Henrik queue)
+        setPregamePlayers((prev) =>
+          prev.map((player) => {
+            const local = localMmrByPuuidPre[player.puuid];
+            if (!local) return player;
+            return {
+              ...player,
+              competitive_tier: local.competitiveTier,
+              rankedRating: local.rankedRating,
+              rank_icon: rankMap[local.competitiveTier] ?? null,
+              actWins: local.actWins,
+              actLosses: local.actLosses,
+              actGames: local.actGames,
+            };
+          }),
+        );
 
         let mmrMap: Record<string, MmrEntry> = {};
 
@@ -695,14 +793,17 @@ export function useLobby(settings: Settings) {
                 player.puuid === playerPuuid
                   ? {
                       ...player,
-                      competitive_tier: entry.competitive_tier,
+                      // Henrik sets peak data only
                       peak_tier: entry.peak_tier,
-                      rank_icon: entry.rank_icon,
                       peak_rank_icon: entry.peak_rank_icon,
                       peakSeasonShort: entry.peakSeasonShort,
-                      actWins: entry.actWins,
-                      actLosses: entry.actLosses,
-                      actGames: entry.actGames,
+                      // Current rank: only fill from Henrik if local MMR didn't already set it
+                      competitive_tier: player.competitive_tier > 0 ? player.competitive_tier : (entry.competitive_tier ?? 0),
+                      rank_icon: player.rank_icon ?? entry.rank_icon,
+                      actWins: player.actWins !== undefined ? player.actWins : entry.actWins,
+                      actLosses: player.actLosses !== undefined ? player.actLosses : entry.actLosses,
+                      actGames: player.actGames !== undefined ? player.actGames : entry.actGames,
+                      // rankedRating: local MMR only -- ...player spread preserves it
                     }
                   : player,
               ),
@@ -726,14 +827,17 @@ export function useLobby(settings: Settings) {
                   player.puuid === p.puuid
                     ? {
                         ...player,
-                        competitive_tier: entry.competitive_tier,
+                        // Henrik sets peak data only
                         peak_tier: entry.peak_tier,
-                        rank_icon: entry.rank_icon,
                         peak_rank_icon: entry.peak_rank_icon,
                         peakSeasonShort: entry.peakSeasonShort,
-                        actWins: entry.actWins,
-                        actLosses: entry.actLosses,
-                        actGames: entry.actGames,
+                        // Current rank: only fill from Henrik if local MMR didn't already set it
+                        competitive_tier: player.competitive_tier > 0 ? player.competitive_tier : (entry.competitive_tier ?? 0),
+                        rank_icon: player.rank_icon ?? entry.rank_icon,
+                        actWins: player.actWins !== undefined ? player.actWins : entry.actWins,
+                        actLosses: player.actLosses !== undefined ? player.actLosses : entry.actLosses,
+                        actGames: player.actGames !== undefined ? player.actGames : entry.actGames,
+                        // rankedRating: local MMR only -- ...player spread preserves it
                       }
                     : player,
                 ),
@@ -746,19 +850,24 @@ export function useLobby(settings: Settings) {
           mmrMap = cachedMMR.current.data;
         }
 
-        const merged: PregamePlayer[] = allMapped.map((row) => ({
-          ...row,
-          competitive_tier: mmrMap[row.puuid]?.competitive_tier ?? 0,
-          rank_icon: mmrMap[row.puuid]?.rank_icon ?? null,
-          peak_tier: mmrMap[row.puuid]?.peak_tier ?? 0,
-          peak_rank_icon: mmrMap[row.puuid]?.peak_rank_icon ?? null,
-          peakSeasonShort: mmrMap[row.puuid]?.peakSeasonShort,
-          actWins: mmrMap[row.puuid]?.actWins,
-          actLosses: mmrMap[row.puuid]?.actLosses,
-          actGames: mmrMap[row.puuid]?.actGames,
-        }));
+        const merged: PregamePlayer[] = allMapped.map((row) => {
+          const local = localMmrByPuuidPre[row.puuid];
+          const henrik = mmrMap[row.puuid];
+          return {
+            ...row,
+            competitive_tier: local?.competitiveTier ?? henrik?.competitive_tier ?? 0,
+            rankedRating: local?.rankedRating,
+            rank_icon: local ? (rankMap[local.competitiveTier] ?? null) : (henrik?.rank_icon ?? null),
+            peak_tier: henrik?.peak_tier ?? 0,
+            peak_rank_icon: henrik?.peak_rank_icon ?? null,
+            peakSeasonShort: henrik?.peakSeasonShort,
+            actWins: local?.actWins ?? henrik?.actWins,
+            actLosses: local?.actLosses ?? henrik?.actLosses,
+            actGames: local?.actGames ?? henrik?.actGames,
+          };
+        });
 
-        setPregamePlayers(applyPartyColorsToMerged(merged));
+        setPregamePlayers(applyPartyColorsToMerged(merged, buildPartyMapFromPresence(partyPresencesPre, merged.map((p) => p.puuid), websocketPartyMapRef.current)));
 
         kickoffPlayerStatsIfNeeded(
           matchId,
@@ -843,11 +952,47 @@ export function useLobby(settings: Settings) {
               rank_icon: null,
               peak_tier: 0,
               peak_rank_icon: null,
+              party_id: p.PartyID ?? undefined,
               party_color: null,
             };
           });
 
-          setPregamePlayers(applyPartyColorsToMerged(mapped));
+          const partyPresencesCore = await waitForAllPresences(mapped.map((p) => p.puuid));
+          setPregamePlayers(applyPartyColorsToMerged(mapped, buildPartyMapFromPresence(partyPresencesCore, mapped.map((p) => p.puuid), websocketPartyMapRef.current)));
+
+          // Phase 1: Local (Riot PD) MMR -- skip if already cached for this match
+          let localMmrByPuuidCore: Record<string, LocalMmrResult> = {};
+          if (localMmrCacheRef.current?.matchId === matchId) {
+            localMmrByPuuidCore = localMmrCacheRef.current.data;
+          } else {
+            const localMmrResultsCore = await Promise.all(
+              mapped.map((p) =>
+                fetchRiotMmrForPlayer(p.puuid, tokens.accessToken, tokens.token, region, clientVersionRef.current)
+                  .then((result) => ({ puuid: p.puuid, result })),
+              ),
+            );
+            for (const { puuid: lp, result } of localMmrResultsCore) {
+              if (result) localMmrByPuuidCore[lp] = result;
+            }
+            localMmrCacheRef.current = { matchId, data: localMmrByPuuidCore };
+          }
+
+          // Apply local rank data immediately
+          setPregamePlayers((prev) =>
+            prev.map((player) => {
+              const local = localMmrByPuuidCore[player.puuid];
+              if (!local) return player;
+              return {
+                ...player,
+                competitive_tier: local.competitiveTier,
+                rankedRating: local.rankedRating,
+                rank_icon: rankMap[local.competitiveTier] ?? null,
+                actWins: local.actWins,
+                actLosses: local.actLosses,
+                actGames: local.actGames,
+              };
+            }),
+          );
 
           let mmrMap: Record<string, MmrEntry> = {};
 
@@ -865,14 +1010,17 @@ export function useLobby(settings: Settings) {
                   player.puuid === playerPuuid
                     ? {
                         ...player,
-                        competitive_tier: entry.competitive_tier,
+                        // Henrik sets peak data only
                         peak_tier: entry.peak_tier,
-                        rank_icon: entry.rank_icon,
                         peak_rank_icon: entry.peak_rank_icon,
                         peakSeasonShort: entry.peakSeasonShort,
-                        actWins: entry.actWins,
-                        actLosses: entry.actLosses,
-                        actGames: entry.actGames,
+                        // Current rank: only fill from Henrik if local MMR didn't already set it
+                        competitive_tier: player.competitive_tier > 0 ? player.competitive_tier : (entry.competitive_tier ?? 0),
+                        rank_icon: player.rank_icon ?? entry.rank_icon,
+                        actWins: player.actWins !== undefined ? player.actWins : entry.actWins,
+                        actLosses: player.actLosses !== undefined ? player.actLosses : entry.actLosses,
+                        actGames: player.actGames !== undefined ? player.actGames : entry.actGames,
+                        // rankedRating: local MMR only -- ...player spread preserves it
                       }
                     : player,
                 ),
@@ -896,14 +1044,17 @@ export function useLobby(settings: Settings) {
                     player.puuid === p.puuid
                       ? {
                           ...player,
-                          competitive_tier: entry.competitive_tier,
+                          // Henrik sets peak data only
                           peak_tier: entry.peak_tier,
-                          rank_icon: entry.rank_icon,
                           peak_rank_icon: entry.peak_rank_icon,
                           peakSeasonShort: entry.peakSeasonShort,
-                          actWins: entry.actWins,
-                          actLosses: entry.actLosses,
-                          actGames: entry.actGames,
+                          // Current rank: only fill from Henrik if local MMR didn't already set it
+                          competitive_tier: player.competitive_tier > 0 ? player.competitive_tier : (entry.competitive_tier ?? 0),
+                          rank_icon: player.rank_icon ?? entry.rank_icon,
+                          actWins: player.actWins !== undefined ? player.actWins : entry.actWins,
+                          actLosses: player.actLosses !== undefined ? player.actLosses : entry.actLosses,
+                          actGames: player.actGames !== undefined ? player.actGames : entry.actGames,
+                          // rankedRating: local MMR only -- ...player spread preserves it
                         }
                       : player,
                   ),
@@ -916,39 +1067,29 @@ export function useLobby(settings: Settings) {
             mmrMap = cachedMMR.current.data;
           }
 
-          const merged: PregamePlayer[] = mapped.map((row) => ({
-            ...row,
-            competitive_tier: mmrMap[row.puuid]?.competitive_tier ?? 0,
-            rank_icon: mmrMap[row.puuid]?.rank_icon ?? null,
-            peak_tier: mmrMap[row.puuid]?.peak_tier ?? 0,
-            peak_rank_icon: mmrMap[row.puuid]?.peak_rank_icon ?? null,
-            peakSeasonShort: mmrMap[row.puuid]?.peakSeasonShort,
-            actWins: mmrMap[row.puuid]?.actWins,
-            actLosses: mmrMap[row.puuid]?.actLosses,
-            actGames: mmrMap[row.puuid]?.actGames,
-          }));
+          const merged: PregamePlayer[] = mapped.map((row) => {
+            const local = localMmrByPuuidCore[row.puuid];
+            const henrik = mmrMap[row.puuid];
+            return {
+              ...row,
+              competitive_tier: local?.competitiveTier ?? henrik?.competitive_tier ?? 0,
+              rankedRating: local?.rankedRating,
+              rank_icon: local ? (rankMap[local.competitiveTier] ?? null) : (henrik?.rank_icon ?? null),
+              peak_tier: henrik?.peak_tier ?? 0,
+              peak_rank_icon: henrik?.peak_rank_icon ?? null,
+              peakSeasonShort: henrik?.peakSeasonShort,
+              actWins: local?.actWins ?? henrik?.actWins,
+              actLosses: local?.actLosses ?? henrik?.actLosses,
+              actGames: local?.actGames ?? henrik?.actGames,
+            };
+          });
 
           kickoffPlayerStatsIfNeeded(
             matchId,
             mapped.map((p) => p.puuid),
           );
 
-          await Promise.all(
-            merged.map(async (p) => {
-              const cached = resolvedAccountLevels[p.puuid];
-              if (cached != null && cached > 0) {
-                p.account_level = cached;
-                return;
-              }
-              const idLevel = identityAccountLevelValue(p.account_level);
-              if (idLevel != null && idLevel > 0) return;
-
-              const level = await fetchHenrikAccountLevel(p.puuid, settings.henrikApiKey);
-              if (level != null && level > 0) p.account_level = level;
-            }),
-          );
-
-          setPregamePlayers(applyPartyColorsToMerged(merged));
+          setPregamePlayers(applyPartyColorsToMerged(merged, buildPartyMapFromPresence(partyPresencesCore, merged.map((p) => p.puuid), websocketPartyMapRef.current)));
 
           try {
             const players: any[] = match.Players ?? [];
@@ -978,14 +1119,13 @@ export function useLobby(settings: Settings) {
         setPregamePlayers([]);
         setMapName("");
         setServerName("");
-        accumulatedPartyIdsByPuuid = {};
-        for (const k of Object.keys(knownPartyMembers)) delete knownPartyMembers[k];
         statsMatchIdRef.current = null;
         statsKickStartedRef.current = null;
+        localMmrCacheRef.current = null;
+        websocketPartyMapRef.current = {};
         setPregameMatchIdForUi(null);
         setPlayerStats({});
         setPlayerStatLoading({});
-        resetHenrikLobbyCaches();
         await flushPendingMatch(puuid);
       }
 
@@ -1003,14 +1143,13 @@ export function useLobby(settings: Settings) {
         setPregamePlayers([]);
         setMapName("");
         setServerName("");
-        accumulatedPartyIdsByPuuid = {};
-        for (const k of Object.keys(knownPartyMembers)) delete knownPartyMembers[k];
         statsMatchIdRef.current = null;
         statsKickStartedRef.current = null;
+        localMmrCacheRef.current = null;
+        websocketPartyMapRef.current = {};
         setPregameMatchIdForUi(null);
         setPlayerStats({});
         setPlayerStatLoading({});
-        resetHenrikLobbyCaches();
         await flushPendingMatch(puuid);
       }
     } finally {

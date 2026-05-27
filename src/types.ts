@@ -51,6 +51,9 @@ export interface PregamePlayer {
   actWins?: number;
   actLosses?: number;
   actGames?: number;
+  rankedRating?: number;
+  party_id?: string;
+  party_size?: number;
   party_color: string | null;
 }
 
@@ -79,6 +82,8 @@ export type MmrDiskCacheEntry = {
   actLosses?: number;
   actGames?: number;
   fetchedAt: number;
+  /** True when Henrik returned 404 for this player -- cached absence, not missing data. */
+  noData?: boolean;
 };
 
 export interface MatchHistorySummary {

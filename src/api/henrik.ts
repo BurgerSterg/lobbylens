@@ -1,12 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { MmrDiskCacheEntry, MmrEntry, PersonalStats, PlayerMatchStats } from "../types";
 
-const MMR_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
-const PLAYER_STATS_CACHE_TTL_MS = 10 * 60 * 1000;
-
-/** Recent-match aggregates keyed by PUUID; refreshed every {@link PLAYER_STATS_CACHE_TTL_MS}. */
+const MMR_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+/** Recent-match aggregates (kept for type compatibility; no longer populated). */
 export const playerStatsCache = new Map<string, PlayerMatchStats>();
-const playerStatsCachedAt = new Map<string, number>();
 
 let diskMmrCache: Record<string, MmrDiskCacheEntry> = {};
 let diskMmrCacheLoaded = false;
@@ -14,13 +11,23 @@ let diskMmrCacheLoaded = false;
 /** Missing / blank tier name while ranked, or unranked row with no label — drop so Henrik is hit again. */
 function diskMmrEntryInvalid(entry: MmrDiskCacheEntry | undefined): boolean {
   if (!entry || typeof entry !== "object") return true;
+
+  // noData entries are valid -- Henrik has no data for this player; let TTL handle expiry
+  if (entry.noData === true) return false;
+
   const tn =
     entry.tierName === undefined || entry.tierName === null ? "" : String(entry.tierName).trim();
   const tier = Number(entry.tier) || 0;
-  if (tier === 0) return tn === "";
+
+  // Unranked players legitimately have no tier name or peak season
+  if (tier === 0) return false;
+
+  // Ranked player must have a tier name
   if (tn === "") return true;
-  // Invalidate ranked entries saved before peakSeasonShort was added so dates re-fetch
-  if (!entry.peakSeasonShort) return true;
+
+  // Only invalidate ranked players missing peakSeasonShort
+  if (tier > 0 && !entry.peakSeasonShort) return true;
+
   return false;
 }
 
@@ -101,7 +108,7 @@ export const cachedMMR: {
 let mmrByPuuid: Record<string, MmrEntry> = {};
 let mmrFetchByPuuid = new Map<string, Promise<MmrEntry>>();
 const MMR_429_RETRY_MS = 65_000;
-const HENRIK_REQUEST_GAP_MS = 2100;
+const HENRIK_REQUEST_GAP_MS = 3500;
 
 /** PUUIDs that hit MMR 429; flushed together after {@link MMR_429_RETRY_MS}. */
 const mmrRetryQueue = new Set<string>();
@@ -139,37 +146,16 @@ function scheduleMmr429BatchFlush(): void {
 }
 
 // MMR, account-level, and recent-stats Henrik calls each use independent 2100ms-spaced queues.
-let mmrQueuePromise: Promise<void> = Promise.resolve();
-let accountQueuePromise: Promise<void> = Promise.resolve();
-let statsQueuePromise: Promise<void> = Promise.resolve();
+// Single unified Henrik request queue -- one request at a time globally
+let henrikQueuePromise: Promise<void> = Promise.resolve();
 
-function henrikFetchMmr(url: string, apiKey: string): Promise<Response> {
-  const result = mmrQueuePromise
-    .then(() => new Promise<void>((r) => setTimeout(r, HENRIK_REQUEST_GAP_MS)))
-    .then(() => fetch(url, { headers: { Authorization: apiKey } }));
-  mmrQueuePromise = result.then(() => {}, () => {});
-  return result;
-}
-
-function henrikFetchAccount(url: string, apiKey: string): Promise<Response> {
-  const result = accountQueuePromise
-    .then(() => new Promise<void>((r) => setTimeout(r, HENRIK_REQUEST_GAP_MS)))
-    .then(() => fetch(url, { headers: { Authorization: apiKey } }));
-  accountQueuePromise = result.then(() => {}, () => {});
-  return result;
-}
-
-function henrikFetchStats(url: string, apiKey: string): Promise<Response> {
-  const result = statsQueuePromise
-    .then(() => new Promise<void>((r) => setTimeout(r, HENRIK_REQUEST_GAP_MS)))
-    .then(() => fetch(url, { headers: { Authorization: apiKey } }));
-  statsQueuePromise = result.then(() => {}, () => {});
-  return result;
-}
-
-/** Match-history backfill / flush (shares spacing with account lookups only). */
+/** All Henrik API calls share one queue so MMR, account, and stats never compete. */
 export function henrikFetch(url: string, apiKey: string): Promise<Response> {
-  return henrikFetchAccount(url, apiKey);
+  const result = henrikQueuePromise
+    .then(() => new Promise<void>((r) => setTimeout(r, HENRIK_REQUEST_GAP_MS)))
+    .then(() => fetch(url, { headers: { Authorization: apiKey } }));
+  henrikQueuePromise = result.then(() => {}, () => {});
+  return result;
 }
 
 export const resolvedAccountLevels: Record<string, number> = {};
@@ -275,39 +261,12 @@ async function fetchHenrikMmrForPlayerImpl(
 
   const promise = (async () => {
     try {
-      const res = await henrikFetchMmr(
+      const res = await henrikFetch(
         `https://api.henrikdev.xyz/valorant/v3/by-puuid/mmr/${region}/pc/${puuid}`,
         henrikApiKey,
       );
 
       if (res.status === 404) {
-        // Safety net 1: some BR/LATAM players are indexed under na in Henrik
-        const resolvedShard = henrikMatchHistoryShard(region);
-        if (resolvedShard !== "na") {
-          const naRes = await henrikFetchMmr(
-            `https://api.henrikdev.xyz/valorant/v3/by-puuid/mmr/na/pc/${puuid}`,
-            henrikApiKey,
-          );
-          if (naRes.ok) {
-            const naData = await naRes.json();
-            diskMmrCache[puuid] = mmrResponseToDiskEntry(naData);
-            await persistMmrCache();
-            const naExtracted = extractHenrikMmrCurrentPeak(naData);
-            const naEntry: MmrEntry = {
-              competitive_tier: naExtracted.currentTier,
-              peak_tier: naExtracted.peakTier,
-              rank_icon: rankMap[naExtracted.currentTier] ?? null,
-              peak_rank_icon: rankMap[naExtracted.peakTier] ?? null,
-              ...(naExtracted.peakSeasonShort ? { peakSeasonShort: naExtracted.peakSeasonShort } : {}),
-              actWins: naExtracted.actWins,
-              actLosses: naExtracted.actLosses,
-              actGames: naExtracted.actGames,
-            };
-            mmrByPuuid[puuid] = naEntry;
-            maybeNotifyRetrySuccess(naEntry);
-            return naEntry;
-          }
-        }
         const entry = emptyEntry();
         mmrByPuuid[puuid] = entry;
         diskMmrCache[puuid] = {
@@ -316,6 +275,7 @@ async function fetchHenrikMmrForPlayerImpl(
           rr: 0,
           peakTier: 0,
           peakTierName: "",
+          noData: true,
           fetchedAt: Date.now(),
         };
         await persistMmrCache();
@@ -398,7 +358,7 @@ export async function fetchHenrikAccountLevel(puuid: string, henrikApiKey: strin
   if (!inflight) {
     inflight = (async () => {
       try {
-        const res = await henrikFetchAccount(
+        const res = await henrikFetch(
           `https://api.henrikdev.xyz/valorant/v1/by-puuid/account/${puuid}`,
           henrikApiKey,
         );
@@ -842,9 +802,9 @@ export async function fetchPersonalStats(
     const histUrl = `https://api.henrikdev.xyz/valorant/v3/by-puuid/matches/${shard}/pc/${puuid}?size=10`;
 
     const [mmrSettled, acctSettled, histSettled] = await Promise.allSettled([
-      henrikFetchMmr(mmrUrl, henrikApiKey),
-      henrikFetchAccount(acctUrl, henrikApiKey),
-      henrikFetchStats(histUrl, henrikApiKey),
+      henrikFetch(mmrUrl, henrikApiKey),
+      henrikFetch(acctUrl, henrikApiKey),
+      henrikFetch(histUrl, henrikApiKey),
     ]);
 
     if (mmrSettled.status === "rejected") return null;
@@ -935,136 +895,13 @@ export async function fetchPersonalStats(
 }
 
 export async function fetchPlayerRecentStats(
-  puuid: string,
-  region: string,
-  henrikApiKey: string,
+  _puuid: string,
+  _region: string,
+  _henrikApiKey: string,
 ): Promise<PlayerMatchStats | null> {
-  try {
-    if (!henrikApiKey.trim()) return null;
-
-    const cachedAt = playerStatsCachedAt.get(puuid);
-    const cached = playerStatsCache.get(puuid);
-    if (
-      cached != null &&
-      cachedAt != null &&
-      typeof cached.headshotPct === "number" &&
-      Date.now() - cachedAt < PLAYER_STATS_CACHE_TTL_MS
-    ) {
-      return cached;
-    }
-
-    const shard = henrikMatchHistoryShard(region);
-
-    const res = await henrikFetchStats(
-      `https://api.henrikdev.xyz/valorant/v3/by-puuid/matches/${shard}/pc/${puuid}?size=10`,
-      henrikApiKey,
-    );
-
-    if (res.status === 404 || !res.ok) return null;
-
-    const data = await res.json();
-    const matches: unknown[] = Array.isArray(data?.data) ? data.data : [];
-    if (matches.length === 0) return null;
-
-    const competitiveMatches = matches.filter((m) => {
-      const meta = (m as { metadata?: { mode_id?: unknown; mode?: unknown } }).metadata;
-      return meta?.mode_id === "competitive" || meta?.mode === "Competitive";
-    });
-    if (competitiveMatches.length === 0) return null;
-
-    const dominant = dominantSeasonId(competitiveMatches as { metadata?: { season_id?: string } }[]);
-    const filtered =
-      dominant != null
-        ? competitiveMatches.filter(
-            (m) =>
-              String((m as { metadata?: { season_id?: unknown } }).metadata?.season_id ?? "") === dominant,
-          )
-        : competitiveMatches;
-
-    if (filtered.length === 0) return null;
-
-    let kills = 0;
-    let deaths = 0;
-    let assists = 0;
-    let wins = 0;
-    let matchesPlayed = 0;
-    let scoreSum = 0;
-    let roundsSum = 0;
-    let hsPctSum = 0;
-    let hsPctMatches = 0;
-
-    for (const raw of filtered) {
-      const m = raw as {
-        players?: { all_players?: Array<{ puuid?: string; team?: string; stats?: Record<string, unknown> }> };
-        teams?: {
-          red?: { has_won?: boolean; rounds_won?: number };
-          blue?: { has_won?: boolean; rounds_won?: number };
-        };
-      };
-      const all = m.players?.all_players ?? [];
-      const pl = all.find((p) => p.puuid === puuid);
-      if (!pl) continue;
-
-      const st = (pl.stats ?? pl) as Record<string, unknown>;
-      const k = Number(st?.kills ?? 0);
-      const d = Number(st?.deaths ?? 0);
-      const a = Number(st?.assists ?? 0);
-      const score = Number(st?.score ?? 0);
-      if (![k, d, a, score].every((n) => Number.isFinite(n))) continue;
-
-      const rw = Number(m.teams?.red?.rounds_won ?? 0);
-      const bw = Number(m.teams?.blue?.rounds_won ?? 0);
-      const rounds = rw + bw;
-      if (!Number.isFinite(rounds) || rounds <= 0) continue;
-
-      matchesPlayed++;
-      kills += k;
-      deaths += d;
-      assists += a;
-      scoreSum += score;
-      roundsSum += rounds;
-
-      const team = String(pl.team ?? "").toLowerCase();
-      const won =
-        (team === "red" && m.teams?.red?.has_won === true) ||
-        (team === "blue" && m.teams?.blue?.has_won === true);
-      if (won) wins++;
-
-      const head = Number(st.headshots ?? 0);
-      const body = Number(st.bodyshots ?? 0);
-      const leg = Number(st.legshots ?? 0);
-      const shotDenom = head + body + leg;
-      if (shotDenom > 0 && [head, body, leg].every((n) => Number.isFinite(n))) {
-        hsPctSum += (head / shotDenom) * 100;
-        hsPctMatches += 1;
-      }
-    }
-
-    if (matchesPlayed === 0) return null;
-
-    const winRate = wins / matchesPlayed;
-    const kda = (kills + assists) / Math.max(deaths, 1);
-    const avgACS = roundsSum > 0 ? scoreSum / roundsSum : 0;
-    const headshotPct =
-      hsPctMatches > 0 ? Math.round((hsPctSum / hsPctMatches) * 10) / 10 : 0;
-
-    const out: PlayerMatchStats = {
-      puuid,
-      kda,
-      kills,
-      deaths,
-      assists,
-      winRate,
-      matchesPlayed,
-      avgACS,
-      headshotPct,
-    };
-    playerStatsCache.set(puuid, out);
-    playerStatsCachedAt.set(puuid, Date.now());
-    return out;
-  } catch {
-    return null;
-  }
+  // Disabled: match history 404s for almost all players and wastes Henrik rate
+  // limit budget that MMR needs. W/L data now comes from MMR seasonal data.
+  return null;
 }
 
 /** Clears Henrik-side caches when returning to menus (matches in-hook party resets). */
@@ -1073,6 +910,7 @@ export function resetHenrikLobbyCaches(): void {
     clearTimeout(mmr429BatchFlushTimeout);
     mmr429BatchFlushTimeout = null;
   }
+  henrikQueuePromise = Promise.resolve();
   mmrRetryQueue.clear();
   mmrRetryMetaByPuuid.clear();
   mmrByPuuid = {};

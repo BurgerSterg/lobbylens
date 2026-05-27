@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose, Engine as _};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::time::Duration;
@@ -414,6 +415,275 @@ mod commands {
         Ok(body)
     }
 
+    async fn get_valorant_client_version() -> String {
+        let fallback = "release-09.00-shipping-9-2459107".to_string();
+
+        let log_path = match std::env::var("LOCALAPPDATA") {
+            Ok(p) => format!("{}\\VALORANT\\Saved\\Logs\\ShooterGame.log", p),
+            Err(_) => return fallback,
+        };
+
+        let content = match tokio::fs::read_to_string(&log_path).await {
+            Ok(c) => c,
+            Err(_) => return fallback,
+        };
+
+        for line in content.lines().rev() {
+            // Pattern 1: "CI server version: release-XX.XX-shipping-X-XXXXXXX"
+            if line.contains("CI server version:") {
+                if let Some(rest) = line.split("CI server version:").nth(1) {
+                    let v = rest.trim().to_string();
+                    if v.starts_with("release-") {
+                        println!("[BurgerLens] Client version from log: {}", v);
+                        return v;
+                    }
+                }
+            }
+            // Pattern 2: "branch=release-XX.XX-shipping"
+            if line.contains("branch=release-") {
+                if let Some(rest) = line.split("branch=").nth(1) {
+                    let v = rest.split_whitespace().next().unwrap_or("").to_string();
+                    if v.starts_with("release-") {
+                        println!("[BurgerLens] Client version from branch: {}", v);
+                        return v;
+                    }
+                }
+            }
+        }
+
+        println!("[BurgerLens] Could not find version in log, using fallback");
+        fallback
+    }
+
+    async fn connect_and_listen(app_handle: &tauri::AppHandle) -> Result<(), String> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::Connector;
+        use tauri::Emitter;
+
+        let lockfile = parse_lockfile_with_retry().await?;
+        let credentials =
+            general_purpose::STANDARD.encode(format!("riot:{}", lockfile.password));
+
+        let url = format!("wss://127.0.0.1:{}/", lockfile.port);
+        let mut request = url
+            .into_client_request()
+            .map_err(|e| format!("WS request build error: {e}"))?;
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Basic {}", credentials)
+                .parse()
+                .map_err(|e: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| {
+                    format!("Invalid header: {e}")
+                })?,
+        );
+
+        let tls_connector = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|e| format!("TLS build error: {e}"))?;
+        let connector = Connector::NativeTls(tls_connector);
+
+        let (ws_stream, _) =
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector))
+                .await
+                .map_err(|e| format!("WS connect error: {e}"))?;
+
+        let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+        ws_sender
+            .send(Message::Text(
+                r#"[5, "OnJsonApiEvent_chat_v4_presences"]"#.to_string(),
+            ))
+            .await
+            .map_err(|e| format!("WS send error: {e}"))?;
+
+        while let Some(msg) = ws_receiver.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(&text) {
+                        if arr.get(0).and_then(|v| v.as_u64()) == Some(8) {
+                            if let Some(payload) = arr.get(2) {
+                                app_handle.emit("presence-event", payload.clone()).ok();
+                            }
+                        }
+                    }
+                }
+                Ok(Message::Close(_)) => break,
+                Err(e) => {
+                    return Err(format!("WS frame error: {e}"));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    #[tauri::command]
+    pub async fn start_presence_websocket(app_handle: tauri::AppHandle) -> Result<(), String> {
+        tokio::spawn(async move {
+            loop {
+                match connect_and_listen(&app_handle).await {
+                    Ok(_) => {
+                        println!("[BurgerLens WS] Disconnected, reconnecting in 3s...");
+                    }
+                    Err(e) => {
+                        println!("[BurgerLens WS] Error: {}, reconnecting in 3s...", e);
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            }
+        });
+        Ok(())
+    }
+
+    #[tauri::command]
+    pub async fn get_client_version() -> Result<String, String> {
+        Ok(get_valorant_client_version().await)
+    }
+
+    #[tauri::command]
+    pub async fn get_client_version_local() -> Result<String, String> {
+        Ok(get_valorant_client_version().await)
+    }
+
+    #[tauri::command]
+    pub async fn get_client_version_api() -> Result<String, String> {
+        let client = reqwest::Client::new();
+        let resp = client
+            .get("https://valorant-api.com/v1/version")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let version = json["data"]["riotClientVersion"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        Ok(version)
+    }
+
+    #[tauri::command]
+    pub async fn get_player_mmr(
+        puuid: String,
+        access_token: String,
+        entitlements_token: String,
+        region: String,
+        client_version: String,
+    ) -> Result<serde_json::Value, String> {
+        let (shard, _) = get_shard_and_region(&region);
+        let url = format!(
+            "https://pd.{}.a.pvp.net/mmr/v1/players/{}",
+            shard, puuid
+        );
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|e| e.to_string())?;
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("X-Riot-Entitlements-JWT", &entitlements_token)
+            .header("X-Riot-ClientPlatform", "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9")
+            .header("X-Riot-ClientVersion", &client_version)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let body = resp.text().await.map_err(|e| format!("Failed to read body: {}", e))?;
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+        Ok(json)
+    }
+
+    #[tauri::command]
+    pub async fn get_player_party(
+        puuid: String,
+        access_token: String,
+        entitlements_token: String,
+        region: String,
+    ) -> Result<serde_json::Value, String> {
+        let (shard, _) = get_shard_and_region(&region);
+        let url = format!(
+            "https://glz-{}-1.{}.a.pvp.net/parties/v1/players/{}",
+            shard, shard, puuid
+        );
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|e| e.to_string())?;
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("X-Riot-Entitlements-JWT", &entitlements_token)
+            .header("X-Riot-ClientPlatform", "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9")
+            .header("X-Riot-ClientVersion", "release-09.00-shipping-9-2459107")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(json)
+    }
+
+    #[tauri::command]
+    pub async fn get_coregame_match_loadouts(
+        match_id: String,
+        access_token: String,
+        entitlements_token: String,
+        region: String,
+    ) -> Result<serde_json::Value, String> {
+        let (shard, _) = get_shard_and_region(&region);
+        let url = format!(
+            "https://glz-{}-1.{}.a.pvp.net/core-game/v1/matches/{}/loadouts",
+            shard, shard, match_id
+        );
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|e| e.to_string())?;
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("X-Riot-Entitlements-JWT", &entitlements_token)
+            .header("X-Riot-ClientPlatform", "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9")
+            .header("X-Riot-ClientVersion", "release-09.00-shipping-9-2459107")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(json)
+    }
+
+    #[tauri::command]
+    pub async fn get_pregame_match_loadouts(
+        match_id: String,
+        access_token: String,
+        entitlements_token: String,
+        region: String,
+    ) -> Result<serde_json::Value, String> {
+        let (shard, _) = get_shard_and_region(&region);
+        let url = format!(
+            "https://glz-{}-1.{}.a.pvp.net/pregame/v1/matches/{}/loadouts",
+            shard, shard, match_id
+        );
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|e| e.to_string())?;
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("X-Riot-Entitlements-JWT", &entitlements_token)
+            .header("X-Riot-ClientPlatform", "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9")
+            .header("X-Riot-ClientVersion", "release-09.00-shipping-9-2459107")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(json)
+    }
+
     #[tauri::command]
     pub fn load_match_history(app: tauri::AppHandle) -> Result<Vec<MatchRecord>, String> {
         let path = app
@@ -510,8 +780,16 @@ pub fn run() {
             commands::get_auth_tokens,
             commands::get_coregame_match_id_external,
             commands::get_coregame_match_external,
+            commands::get_coregame_match_loadouts,
+            commands::get_pregame_match_loadouts,
             commands::get_party_members,
+            commands::get_player_party,
             commands::get_player_names,
+            commands::start_presence_websocket,
+            commands::get_client_version,
+            commands::get_client_version_local,
+            commands::get_client_version_api,
+            commands::get_player_mmr,
             commands::load_match_history,
             commands::save_match_history,
             commands::load_mmr_cache,
